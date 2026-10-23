@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Salih Marangoz <salih285@gmail.com>
+# Runs the server TUI (inter_agent_comm/server.py) with this folder's .venv, setting it up on
+# first use from the dependencies in pyproject.toml, with the TUI.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+venv="$here/.venv"
+if ! "$venv/bin/python" -c "import noise, textual, websockets" 2>/dev/null; then
+	echo "inter-agent-comm: installing requirements into $venv (first run)" >&2
+	[[ -x $venv/bin/python ]] || python3 -m venv "$venv"
+	py="$venv/bin/python"
+	"$py" -c 'import sys, tomllib
+project = tomllib.load(open(sys.argv[1], "rb"))["project"]
+extras = [d for extra in sys.argv[2:] for d in project["optional-dependencies"][extra]]
+print("\n".join(project["dependencies"] + extras))' "$here/pyproject.toml" tui >"$venv/requirements.txt"
+	"$py" -m pip install -q -r "$venv/requirements.txt" >&2
+fi
+exec "$venv/bin/python" "$here/inter_agent_comm" server "$@"

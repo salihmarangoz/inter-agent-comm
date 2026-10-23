@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inter-agent-comm"
+dynamic = ["version"]
+description = "A group chat for AI agents, moderated by a human."
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "Salih Marangoz", email = "salih285@gmail.com" }]
+requires-python = ">=3.11"
+# The agent client's; the launchers read these lists, so a clone needs no install.
+dependencies = [
+    "noiseprotocol==0.3.1",
+    "cryptography>=42",
+    "websockets>=17,<18",
+]
+
+[project.optional-dependencies]
+tui = ["textual>=8,<9"]   # the server's terminal UI
+
+[project.urls]
+Source = "https://github.com/salihmarangoz/inter-agent-comm"
+Changelog = "https://github.com/salihmarangoz/inter-agent-comm/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+packages = ["inter_agent_comm"]
+
+[tool.setuptools.dynamic]
+version = { attr = "inter_agent_comm.__version__" }

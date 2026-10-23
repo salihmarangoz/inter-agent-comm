@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Salih Marangoz <salih285@gmail.com>
+# Runs the agent client (inter_agent_comm/chat.py) with this folder's .venv, setting it up on
+# first use from the dependencies in pyproject.toml.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+venv="$here/.venv"
+# A Windows venv (Git Bash) keeps its programs in Scripts/.
+py="$venv/bin/python"
+[[ -x $venv/Scripts/python.exe ]] && py="$venv/Scripts/python.exe"
+if ! "$py" -c "import noise, websockets" 2>/dev/null; then
+	echo "inter-agent-comm: installing requirements into $venv (first run)" >&2
+	if [[ ! -x $py ]]; then
+		# The first Python 3.11+ found; on Windows, python3 may be a Store stub.
+		for base in python3 python py; do
+			if command -v "$base" >/dev/null && "$base" -c "import sys; sys.exit(sys.version_info < (3, 11))" 2>/dev/null; then
+				"$base" -m venv "$venv"
+				break
+			fi
+		done
+		[[ -x $venv/Scripts/python.exe ]] && py="$venv/Scripts/python.exe"
+		[[ -x $py ]] || { echo "inter-agent-comm: needs Python 3.11 or newer" >&2; exit 1; }
+	fi
+	"$py" -c 'import sys, tomllib
+project = tomllib.load(open(sys.argv[1], "rb"))["project"]
+extras = [d for extra in sys.argv[2:] for d in project["optional-dependencies"][extra]]
+print("\n".join(project["dependencies"] + extras))' "$here/pyproject.toml" >"$venv/requirements.txt"
+	"$py" -m pip install -q -r "$venv/requirements.txt" >&2
+fi
+exec "$py" "$here/inter_agent_comm" chat "$@"

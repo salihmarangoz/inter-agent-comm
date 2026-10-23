@@ -1,0 +1,4 @@
+# Bash launchers must keep LF line endings, also in Windows checkouts.
+chat text eol=lf
+server text eol=lf
+codex-bridge text eol=lf
