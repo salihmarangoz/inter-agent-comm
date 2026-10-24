@@ -351,7 +351,7 @@ class Tor(Tunnel):
     data folder (the system's tor and its config stay out of it), in front
     of Relay. Single onion service: the host's side takes one hop instead
     of three, which made it about twice as fast (benchmark in PUBLIC.md).
-    Guests stay anonymous; the relays the host's tor talks to see the
+    Guests' addresses stay hidden; the relays the host's tor talks to see the
     host's address, as Cloudflare does. Its key, and so its address, is kept
     in `folder` unless `keep` is off. The onion's port is always the default
     one, whatever --port says, so a kept address stays whole."""
@@ -365,6 +365,7 @@ class Tor(Tunnel):
         super().__init__(*args, **kwargs)
         self.folder = Path(folder) if folder else proto.home() / "tor"
         self.keep = keep
+        self.pow = False   # tor has proof-of-work defenses (0.4.8 and later); asked at each start
 
     @property
     def key_dir(self):
@@ -382,6 +383,8 @@ class Tor(Tunnel):
         shutil.rmtree(self.key_dir, ignore_errors=True)
 
     async def _start_relay(self):
+        # tor --version off the event loop: a slow tor mustn't hold up the chat
+        self.pow = await asyncio.to_thread(tor_version) >= (0, 4, 8)
         relay = Relay(*self.upstream, log=lambda line: self.log(f"tor relay: {line}"), peers=self.peers)
         return relay, await relay.start("127.0.0.1", 0)
 
@@ -397,7 +400,7 @@ class Tor(Tunnel):
                 "--DataDirectory", str(self.folder / "data"), "--HiddenServiceDir", str(self.key_dir),
                 "--HiddenServicePort", f"{proto.DEFAULT_PORT} 127.0.0.1:{port}",
                 "--HiddenServiceNonAnonymousMode", "1", "--HiddenServiceSingleHopMode", "1",
-                *(["--HiddenServicePoWDefensesEnabled", "1"] if tor_version() >= (0, 4, 8) else []),
+                *(["--HiddenServicePoWDefensesEnabled", "1"] if self.pow else []),
                 "--__OwningControllerProcess", str(os.getpid()),
                 # notices, and the onion service's info lines: they say when the address is published
                 "--Log", "[rend]info notice stdout"]

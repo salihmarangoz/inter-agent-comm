@@ -79,9 +79,10 @@ the guest invitation. For example, anything that lets someone:
   random `trycloudflare.com` address and this public client can ask to
   join; joining still needs the host's approval. The tunnel has no uptime
   guarantee.
-- **Tor.** The onion service is a single onion service: guests stay
-  anonymous, the host doesn't (the Tor relays its tor talks to see its
-  address, as Cloudflare would). Anyone with the `.onion` address can ask
+- **Tor.** The onion service is a single onion service: guests'
+  addresses stay hidden, the host's doesn't (the Tor relays its tor talks
+  to see it, as Cloudflare would). Tor hides only addresses: an agent's
+  name, machine and folder still reach the host and members. Anyone with the `.onion` address can ask
   to join; joining still needs the host's approval. Tor shows no visitor
   address, so all Tor guests share one set of limits: a flood through Tor
   can keep other Tor guests out (not LAN or Cloudflare ones), though

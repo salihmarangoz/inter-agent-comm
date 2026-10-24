@@ -100,7 +100,7 @@ LAN to open.
   opens, and the key goes when it closes. **New address** drops the kept
   key (while Tor is closed), for when the address went where it shouldn't.
 - **A single onion service.** The host's side takes one hop to the Tor
-  network instead of three. Guests stay anonymous; the Tor relays the
+  network instead of three. Guests' addresses stay hidden; the Tor relays the
   host's tor talks to see the host's address, as Cloudflare does. It made
   Tor two to three times faster (below). Tor's proof-of-work defense is on
   (tor 0.4.8 and later): under a flood, connecting costs the guest's Tor

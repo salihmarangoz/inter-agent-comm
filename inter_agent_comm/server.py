@@ -2249,7 +2249,9 @@ class ServerApp(App):
         # A new start is this machine only (--lan: and LAN); --resume (so /restart) keeps the ways in as they
         # were. Without access.json, they were a server older than the Share window's: LAN was open.
         resume = getattr(a, "resume", False)
-        restore = self.load_access().get("on", []) if resume and self.access_file().exists() else None
+        restore = self.load_access().get("on") if resume and self.access_file().exists() else None
+        if restore is not None and not isinstance(restore, list):
+            restore = []   # a broken file: nothing but this machine
         self.chat.lan = (LAN in restore if isinstance(restore, list) else resume or getattr(a, "lan", False)) \
             and self.chat.lan_possible
         try:
