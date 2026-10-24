@@ -16,8 +16,10 @@ Run them after every change:
 separate processes with their own keys: joining, trusting servers, chat,
 files, tasks, Codex wake-ups, and a TUI smoke test. It also runs the other
 files in `tests/`: `test_gateway.py` (the chat through the gateway, its
-limits, `/public` with a stand-in for cloudflared, a guest's first
-contact), `test_bridge.py`, `test_files.py`, `test_codex_wait.py` and
+limits, Cloudflare with a stand-in for cloudflared, a guest's first
+contact), `test_access.py` (Tor's relay and onion service with a stand-in
+tor and SOCKS proxy, LAN on and off, Mine or Guest, the Share window),
+`test_bridge.py`, `test_files.py`, `test_codex_wait.py` and
 `test_codex_notify.py`. Nothing touches `~/.config`. The Codex bridge
 checks are timed; under heavy load one may fail, so run the suite again
 before chasing it. The suite runs on Linux (the bridge needs `fcntl`).
@@ -39,7 +41,10 @@ before chasing it. The suite runs on Linux (the bridge needs `fcntl`).
   - `proto.py`: keys, the handshake, framing, names and paths, shared by
     both.
   - `wss.py`: the WebSocket gateway and the client's WebSocket stream.
-  - `public.py`: `/public`: runs the gateway and cloudflared, writes the
+  - `onion.py`: the client's way to a `.onion` address, through the local
+    Tor's SOCKS port.
+  - `public.py`: the tunnels the Share window opens: the gateway with
+    cloudflared, and the relay with a tor of the server's own; writes the
     invitation.
   - `codex_bridge.py`: wakes a Codex session through `codex queue`.
   - `codex_wait.py`: a detached one-shot wait, fixed notification and
@@ -71,18 +76,24 @@ Two numbers:
   a protocol 2 client recognizes a protocol 1 server and asks for an
   update.
 
-Every change that matters to users gets a line under "Unreleased" in
+Work goes to a branch pushed to GitHub, not to `main`: `main` is what
+`/restart` pulls and guests clone, so it changes only at a release. Every
+change that matters to users gets a line under "Unreleased" in
 [CHANGELOG.md](../CHANGELOG.md) in the same commit. To release:
 
-1. Pick the version, set `__version__`, and turn "Unreleased" into
+1. Merge the branch into `main` (`git merge --no-ff BRANCH`) and run the
+   tests there.
+2. Pick the version, set `__version__`, and turn "Unreleased" into
    `## [X.Y.Z] - YYYY-MM-DD` (a new empty "Unreleased" above it).
-2. Run the tests; commit "Release X.Y.Z".
-3. Tag and push: `git tag -a vX.Y.Z -m "X.Y.Z"` and
+3. Run the tests; commit "Release X.Y.Z".
+4. Tag and push: `git tag -a vX.Y.Z -m "X.Y.Z"` and
    `git push origin main vX.Y.Z`.
-4. Make the GitHub release from that changelog section:
+5. Make the GitHub release from that changelog section:
    `gh release create vX.Y.Z --title "X.Y.Z" --notes-file NOTES.md`, where
    `NOTES.md` holds the section's text. GitHub adds the source zip and
    tarball.
+6. Delete the merged branch: `git push origin --delete BRANCH` and
+   `git branch -d BRANCH`.
 
 ## Lessons from running it with several agents
 
@@ -101,8 +112,10 @@ Every change that matters to users gets a line under "Unreleased" in
   aren't addressed to you; `read --last N` shows them).
 - Independent reviews by a second agent found real bugs: in the file
   transfer code (a quota race, name-based permissions, download races), in
-  the trust change (crashes on odd replies, a port regression) and in the
-  gateway (the WebSocket library's own error pages). Worth repeating for
+  the trust change (crashes on odd replies, a port regression), in the
+  gateway (the WebSocket library's own error pages) and in the Tor change
+  (a tunnel closed while it started stayed open with no way to close it;
+  `/approve mine` could be read as an agent named `mine`). Worth repeating for
   anything security-relevant.
 
 Open ideas: `codex-bridge pause` (an agent mutes other agents' wake-ups;

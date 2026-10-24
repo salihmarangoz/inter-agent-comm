@@ -39,13 +39,14 @@ ORCHESTRATOR = "orchestrator"
 TASK_DONE_KEEP = 20       # finished tasks `task list` still shows (--all: every one)
 ORCHESTRATOR_IDLE = 1800  # seconds unseen before another agent may take the orchestrator role
 # Join requests wait for the host; these keep a flood from filling the TUI,
-# e.g. while the room is public (/public). Tunnelled agents all reach the
-# server from this machine, so their per-address limit is the gateway's.
+# e.g. while the room is public (a tunnel is on). Tunnelled agents all reach the
+# server from this machine, so their per-address limit is their relay's.
 MAX_PENDING = 20          # join requests waiting at once
 LOCAL_RESERVED = 5        # ... of which only agents on this machine may take the last few
-MAX_PENDING_PER_IP = 3    # from one address (not this machine)
-MAX_PENDING_PUBLIC = 10   # through /public, so local agents always find room
-PUBLIC = " (public)"      # marks the address of an agent that came through /public
+MAX_PENDING_PER_IP = 3    # from one address (not this machine); all of Tor counts as one
+MAX_PENDING_PUBLIC = 10   # through the tunnels, so local agents always find room
+LOCAL, LAN, CF, TOR, TUNNELS = proto.LOCAL, proto.LAN, proto.CF, proto.TOR, proto.TUNNELS
+GUEST = " (guest)"        # after a guest's machine in who
 RESTART_DELAY = 15        # seconds the host has to cancel the orchestrator's restart
 SHUTDOWN_DELAY = 60       # ... and its shutdown: the chat stays down until the host starts it
 PENDING_TTL = 600         # seconds a request lasts without its agent calling (wait keeps it alive)
@@ -129,6 +130,10 @@ class Member:
     approved: str = ""
     muted: bool = False
     ip: str = ""
+    via: str = ""         # how its current call came: LOCAL, LAN, CF or TOR
+    # The host's choice at approval: someone else's agent (True) or the host's own (False).
+    # None: approved before there was a choice; then it's a guest while it comes through a tunnel.
+    guest: bool | None = None
     cursor: int = 0       # id of the last message this member has seen
     seen: float = 0.0
     waiting: int = 0      # open wait calls
@@ -138,7 +143,7 @@ class Member:
                            # (True for members saved by older versions, without this field)
 
 
-SAVED = ("name", "host", "cwd", "agent", "about", "approved", "muted", "role", "welcomed")
+SAVED = ("name", "host", "cwd", "agent", "about", "approved", "muted", "role", "welcomed", "guest")
 
 
 @dataclass
@@ -176,9 +181,10 @@ class Request:
     cwd: str
     agent: str
     about: str
-    ip: str
+    ip: str               # "" through Tor, which shows no address
     since: float
     seen: float = 0.0     # the agent's last call; stale requests make room for new ones
+    via: str = LAN        # LOCAL, LAN, CF or TOR
 
 
 STOPPED = ("The host stopped you (/stop): stop what you're doing and wait. Until the host says /go, only "
@@ -191,18 +197,32 @@ def error(code, message):
     return {"type": "error", "code": code, "message": message}
 
 
-def same_machine(conn, ip):
-    """Whether the agent runs on the server's own machine: it connected from
-    loopback, or from the very address it connected to. A /public guest
-    never counts, though its gateway runs here too."""
-    if ip.endswith(PUBLIC):
-        return False
+def same_machine(writer, ip):
+    """Whether the peer runs on the server's own machine: it connected from
+    loopback, or from the very address it connected to. A tunnel's relay
+    runs here too: the server looks those connections up in `relayed`
+    first."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    sock = conn.writer.get_extra_info("sockname")
+    sock = writer.get_extra_info("sockname")
     return addr.is_loopback or (sock is not None and ip == sock[0])
+
+
+def takes_loopback(listen):
+    """Whether listening on `listen` takes in 127.0.0.1 too: all interfaces do;
+    "::" doesn't, since asyncio makes it IPv6 only."""
+    return listen in (None, "", "0.0.0.0")
+
+
+def is_loopback(listen):
+    if listen == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(listen).is_loopback
+    except ValueError:
+        return False
 
 
 @dataclass
@@ -407,16 +427,17 @@ class Conn:
                 return obj
 
 
-def _group(ip):
-    """What the per-address join limit counts: an IPv6 address as its /64,
-    since one machine usually has a whole /64; anything else as it is."""
+def _group(via, ip):
+    """What the per-address join limit counts: the way in and the address,
+    an IPv6 address as its /64, since one machine usually has a whole /64.
+    Tor shows no address: all of it is one."""
     try:
-        addr = ipaddress.ip_address(ip.removesuffix(PUBLIC))
+        addr = ipaddress.ip_address(ip)
     except ValueError:
-        return ip
+        return via, ip
     if addr.version == 6:
-        return str(ipaddress.ip_network(f"{addr}/64", strict=False)) + (PUBLIC if ip.endswith(PUBLIC) else "")
-    return ip
+        return via, str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return via, ip
 
 
 class ChatServer:
@@ -424,8 +445,12 @@ class ChatServer:
     the TUI what changed: message, request, requests, members, error."""
 
     def __init__(self, name, port, home, transcripts=None, listen=None, notify=None, files=None, resume=False,
-                 trash=None, lead=""):
+                 trash=None, lead="", lan=False):
         self.name, self.port, self.listen = name, port, listen
+        # The LAN way in, on `listen`: closed unless asked for; the host opens it from the TUI.
+        self.lan = lan and not is_loopback(listen)
+        self.listeners = []   # asyncio servers: --listen while LAN is on, and 127.0.0.1
+        self.lan_tasks = set()   # connections from other machines, cut when LAN turns off
         self.lead = lead      # --orchestrator: holds the role whenever it's a member
         self.resume_chat = resume  # False: a restart starts a new chat
         self.files = FileStore(files or proto.files_dir())
@@ -441,10 +466,9 @@ class ChatServer:
         self.requests = {}    # public key (base64) -> Request
         self.rejected = set()  # keys the host rejected while this server runs
         self.busy_noted = 0.0  # when the TUI last heard that join requests were refused
-        self.relayed = {}      # /public's gateway: (host, port) of its upstream end -> visitor address
+        self.relayed = {}      # the tunnels' relays: (host, port) of an upstream end -> (CF or TOR, visitor address)
         self.kicked = set()
         self.changed = asyncio.Event()
-        self.server = None
         self.tasks = set()    # asyncio tasks of open connections
         self.open_conns = {}  # address -> open connections from it (not counting this machine)
         self.board = {}       # task id -> Task
@@ -461,20 +485,36 @@ class ChatServer:
 
     # --- what the host does (from the TUI) ---
 
-    def approve(self, key):
+    def approve(self, key, guest=None):
+        """Let a request in, as the host's own agent (guest False) or someone
+        else's (True). None: a guest unless it runs on this machine."""
         request = self.requests.pop(key, None)
         if request is None:
             return None
+        if guest is None:
+            guest = request.via != LOCAL
         member = Member(key=key, name=request.name, host=request.host, cwd=request.cwd,
-                        agent=request.agent, about=request.about, ip=request.ip,
+                        agent=request.agent, about=request.about, ip=request.ip, via=request.via, guest=guest,
                         approved=dt.datetime.now().isoformat(timespec="seconds"), welcomed=False,
                         cursor=max(0, self.next_id - 1 - HISTORY_ON_JOIN), seen=time.time())
         self.members[key] = member
         self.kicked.discard(key)
         self._save_members()
         about = f": {member.about}" if member.about else ""
-        via = " through /public" if member.ip.endswith(PUBLIC) else ""
-        self._post("server", f"{member.name} joined from {member.host or member.ip}{via}{about}", "event")
+        # The way in first: the machine's name is the agent's own words
+        self._post("server", f"{member.name} joined by {member.via}{' as a guest' if guest else ''}, "
+                             f"machine {member.host or member.ip or '?'}{about}", "event")
+        return member
+
+    def set_guest(self, name, guest):
+        """The host changes their mind: a member becomes a guest, or the host's own."""
+        member = self.by_name(name)
+        if member is None or self._guest(member) == guest and member.guest is not None:
+            return member
+        member.guest = guest
+        self._save_members()
+        self._post("server", f"The host made {member.name} " + ("a guest" if guest else "one of the host's own agents"),
+                   "event")
         return member
 
     def reject(self, key):
@@ -568,7 +608,9 @@ class ChatServer:
         rows = [{"name": CONSOLE, "host": self.name, "about": "the human at the server's console",
                  "status": "console", "role": HUMAN_SERVER}]
         for m in sorted(self.members.values(), key=lambda m: m.name):
-            rows.append({"name": m.name, "host": m.host + (PUBLIC if m.ip.endswith(PUBLIC) else ""),
+            # " (guest)" in host for clients that print only host (before 0.2)
+            rows.append({"name": m.name, "host": m.host + (GUEST if self._guest(m) else ""), "via": m.via,
+                         "guest": self._guest(m),
                          "about": m.about, "agent": m.agent,
                          "status": self.status(m), "role": self.role_of(m.name), "wakes": m.wakes})
         return rows
@@ -576,9 +618,7 @@ class ChatServer:
     # --- network ---
 
     async def start(self):
-        self.server = await asyncio.start_server(self._handle, host=self.listen, port=self.port)
-        if self.port == 0:
-            self.port = self.server.sockets[0].getsockname()[1]
+        await self._listen()
         clock = dt.datetime.now().strftime("%H:%M:%S")
         self._transcript_line(f"\n---\n\n*{clock} Server restarted; the chat goes on (--resume).*\n\n"
                               if self.resume_chat else f"\n---\n\n*{clock} New chat.*\n\n")
@@ -597,24 +637,71 @@ class ChatServer:
             self.history_timer.cancel()
             self.history_timer = None
         self.save_history()
-        if self.server:
-            self.server.close()
+        listeners, self.listeners = self.listeners, []
+        for listener in listeners:
+            listener.close()
         for task in list(self.tasks):
             task.cancel()
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
-        if self.server:
-            await self.server.wait_closed()
+        for listener in listeners:
+            await listener.wait_closed()
+
+    async def _listen(self):
+        """Listen as self.lan says: on --listen (all interfaces by default)
+        while LAN is on, and on 127.0.0.1 always, for agents on this machine
+        and the tunnels' relays. All interfaces take in 127.0.0.1 too."""
+        for listener in self.listeners:
+            listener.close()   # stops new connections; open ones go on
+        self.listeners = []
+        hosts = [self.listen] if self.lan else []
+        if not (self.lan and takes_loopback(self.listen)):
+            hosts.append("127.0.0.1")
+        if self.port == 0:   # any free port (the tests): one for all, though all interfaces are two sockets
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                self.port = probe.getsockname()[1]
+        for host in hosts:
+            self.listeners.append(await asyncio.start_server(self._handle, host=host, port=self.port))
+
+    @property
+    def lan_possible(self):
+        return not is_loopback(self.listen)
+
+    async def set_lan(self, on):
+        """Open or close the LAN way in. Closing it cuts the agents on
+        other machines that are connected now (a wait, a transfer)."""
+        if on == self.lan or (on and not self.lan_possible):
+            return
+        self.lan = on
+        try:
+            await self._listen()
+        except OSError:
+            self.lan = False
+            await self._listen()
+            raise
+        finally:
+            if not self.lan:
+                for task in list(self.lan_tasks):
+                    task.cancel()
 
     async def _handle(self, reader, writer):
         task = asyncio.current_task()
         self.tasks.add(task)
         peer = writer.get_extra_info("peername")
         ip = peer[0] if peer else "?"
-        counted = not self._local(ip)
+        via = LOCAL if same_machine(writer, ip) else LAN
+        if via == LAN and not self.lan:   # one accepted as LAN closed, or forwarded to 127.0.0.1 from outside
+            writer.close()
+            self.tasks.discard(task)
+            return
+        if via == LAN:
+            self.lan_tasks.add(task)
+        counted = None if self._local(ip) else ip   # the peer's address, which the connection counts against
         if counted and self.open_conns.get(ip, 0) >= MAX_CONNS_PER_IP:
             writer.close()
             self.tasks.discard(task)
+            self.lan_tasks.discard(task)
             return
         if counted:
             self.open_conns[ip] = self.open_conns.get(ip, 0) + 1
@@ -624,11 +711,11 @@ class ChatServer:
                     proto.accept(reader, writer, self.private, self.name), proto.HANDSHAKE_TIMEOUT)
             except Exception:
                 return  # scanners, telnet by hand, a client with the wrong server key
-            # Through /public, the peer is the gateway on this machine; it has
-            # recorded the visitor by now (it relays nothing before that).
-            visitor = self.relayed.get(tuple(peer[:2])) if peer else None
-            if visitor:
-                ip = visitor + PUBLIC
+            # Through a tunnel, the peer is its relay on this machine; it has
+            # recorded the way in and the visitor by now (it relays nothing before that).
+            relayed = self.relayed.get(tuple(peer[:2])) if peer else None
+            if relayed:
+                via, ip = relayed
             conn = Conn(reader, writer, noise)
             if proto.b64(public) not in self.members:
                 conn.opener.limit = OUTSIDER_OBJECT
@@ -636,31 +723,32 @@ class ChatServer:
                 request = await asyncio.wait_for(conn.recv(), 30)
                 if not isinstance(request, dict):
                     request = {}
-                await conn.send(await self._serve(conn, public, hello, ip, request))
+                await conn.send(await self._serve(conn, public, hello, ip, via, request))
             except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError,
                     proto.ProtocolError):
                 pass
             except Exception as e:
                 self.notify("error", f"{ip}: {type(e).__name__}: {e}")
         finally:
-            if peer:   # the gateway leaves its entry to us, so it's there for the lookup above
+            if peer:   # the relay leaves its entry to us, so it's there for the lookup above
                 self.relayed.pop(tuple(peer[:2]), None)
             if counted:
-                self.open_conns[ip] -= 1
-                if not self.open_conns[ip]:
-                    del self.open_conns[ip]
+                self.open_conns[counted] -= 1
+                if not self.open_conns[counted]:
+                    del self.open_conns[counted]
             writer.close()
             self.tasks.discard(task)
+            self.lan_tasks.discard(task)
 
-    async def _serve(self, conn, public, hello, ip, request):
+    async def _serve(self, conn, public, hello, ip, via, request):
         key = proto.b64(public)
         op = request.get("op")
         member = self.members.get(key)
         if member is not None:
-            member.seen, member.ip = time.time(), ip
+            member.seen, member.ip, member.via = time.time(), ip, via
             self.notify("members")
         if op == "join":
-            return self._join(key, public, hello, ip)
+            return self._join(key, public, hello, ip, via)
         if op == "wait":
             return await self._wait(conn, key, bool(request.get("mentions")), request.get("timeout"))
         if member is None:
@@ -721,9 +809,11 @@ class ChatServer:
         return error("bad_op", f"unknown op {op!r}")
 
     def _guest(self, member):
-        """A member that came through /public (as of its current call). Guests
-        don't see the shared folder (the default rules: no internal details with guests)."""
-        return member.ip.endswith(PUBLIC)
+        """Someone else's agent, as the host approved it (or, approved before
+        that choice, one that comes through a tunnel). Guests don't see the
+        shared folder (the default rules: no internal details with guests)
+        and can't lead."""
+        return member.guest if member.guest is not None else member.via in TUNNELS
 
     def _shown(self, member, message):
         return not (message.get("no_guests") and self._guest(member))
@@ -746,17 +836,17 @@ class ChatServer:
         if stale:
             self.notify("requests")
 
-    def _no_room_for(self, ip):
-        """An error if a new join request from ip can't be taken now."""
+    def _no_room_for(self, ip, via):
+        """An error if a new join request from ip, come in by via, can't be taken now."""
         now = time.time()
-        local = self._local(ip)
+        local = via == LOCAL
         if len(self.requests) >= (MAX_PENDING if local else MAX_PENDING - LOCAL_RESERVED):
             why = f"{len(self.requests)} agents are already waiting for the host's approval"
-        elif ip.endswith(PUBLIC) and sum(r.ip.endswith(PUBLIC) for r in self.requests.values()) \
-                >= MAX_PENDING_PUBLIC:
+        elif via in TUNNELS and sum(r.via in TUNNELS for r in self.requests.values()) >= MAX_PENDING_PUBLIC:
             why = f"{MAX_PENDING_PUBLIC} agents from outside are already waiting for the host's approval"
-        elif not local and sum(_group(r.ip) == _group(ip) for r in self.requests.values()) >= MAX_PENDING_PER_IP:
-            why = f"{MAX_PENDING_PER_IP} agents from {ip.removesuffix(PUBLIC)} are already waiting for the host's approval"
+        elif not local and sum(_group(r.via, r.ip) == _group(via, ip) for r in self.requests.values()) \
+                >= MAX_PENDING_PER_IP:
+            why = f"{MAX_PENDING_PER_IP} agents from {ip or via} are already waiting for the host's approval"
         else:
             return None
         if now - self.busy_noted > 60:   # one line a minute in the TUI, not one per attempt
@@ -765,14 +855,15 @@ class ChatServer:
         return error("busy", f"{why}; try again later.")
 
     def _local(self, ip):
-        """An agent on this machine: loopback, or the address the server listens
-        on. Agents through /public carry their visitor's address instead."""
+        """A connection from this machine, before the handshake: loopback, or the
+        address the server listens on (so the tunnels' relays too: they have
+        limits of their own)."""
         try:
             return ipaddress.ip_address(ip).is_loopback or ip == self.listen
         except ValueError:
             return False
 
-    def _join(self, key, public, hello, ip):
+    def _join(self, key, public, hello, ip, via):
         if key in self.members:
             return {"type": "ok", "state": "member", "name": self.members[key].name, "server": self.name}
         if key in self.rejected:
@@ -785,10 +876,10 @@ class ChatServer:
         if self.by_name(name) or any(r.name == name and r.key != key for r in self.requests.values()):
             return error("name_taken", f"Another agent already uses the name {name}.")
         new = key not in self.requests
-        if new and (refused := self._no_room_for(ip)):
+        if new and (refused := self._no_room_for(ip, via)):
             return refused
         code = proto.new_pairing_code() if new else self.requests[key].code
-        request = Request(key=key, name=name, code=code, ip=ip, since=time.time(),
+        request = Request(key=key, name=name, code=code, ip=ip, via=via, since=time.time(),
                           seen=time.time(),
                           host=proto.clean(hello.get("host", ""), 100, newlines=False),
                           cwd=proto.clean(hello.get("cwd", ""), 300, newlines=False),
@@ -865,7 +956,7 @@ class ChatServer:
         if member.muted:
             return error("muted", "The host muted you; you can't offer files.")
         if shared and self._guest(member):
-            return error("guest", "The shared folder is for the host's own agents, not guests through /public.")
+            return error("guest", "The shared folder is for the host's own agents, not guests.")
         to = None if shared else self.by_name(str(request.get("to", "")))
         if not shared and (to is None or to.key == member.key):
             return error("bad_target", "Offer files to another member, by name.")
@@ -1083,7 +1174,7 @@ class ChatServer:
         SHUTDOWN_DELAY) so the host can cancel."""
         if self.current_orchestrator() != member.name:
             return error("not_orchestrator", f"Only the orchestrator can {kind} the server.")
-        if not same_machine(conn, member.ip):
+        if member.via != LOCAL:   # as of this call
             return error("not_local", f"Only an orchestrator on the server's own machine can {kind} it.")
         if self.restart_pending:
             return error("restart_pending", f"{self.restart_pending}'s {self.pending_kind} is already counting down.")
@@ -1197,7 +1288,9 @@ class ChatServer:
         return {"type": "ok"}
 
     def current_orchestrator(self):
-        if self.orchestrator and self.by_name(self.orchestrator):
+        """A guest never leads: one the host made a guest gives the role back."""
+        holder = self.by_name(self.orchestrator) if self.orchestrator else None
+        if holder and not self._guest(holder):
             return self.orchestrator
         lead = self.by_name(self.lead) if self.lead else None
         return self.lead if lead and not self._guest(lead) else ""
@@ -1220,7 +1313,7 @@ class ChatServer:
         member = self.by_name(name)
         if role == ORCHESTRATOR:
             if self._guest(member):
-                return error("guest", "Guests through /public can't be the orchestrator.")
+                return error("guest", "Guests can't be the orchestrator.")
             holder = self.by_name(self.current_orchestrator())
             idle = holder and not holder.waiting and time.time() - holder.seen > ORCHESTRATOR_IDLE
             if holder and holder.name != name and (not self.lead or name != self.lead) and not idle:
@@ -1243,7 +1336,7 @@ class ChatServer:
         if target is None:
             return error("no_member", f"No member named {to!r}.")
         if self._guest(target):
-            return error("guest", "Guests through /public can't be the orchestrator.")
+            return error("guest", "Guests can't be the orchestrator.")
         current = self.current_orchestrator()
         if by != CONSOLE and by != current:
             return error("not_orchestrator", f"Only the orchestrator ({current or 'nobody'}) or the host "
@@ -1520,6 +1613,13 @@ class ChatServer:
         self.notify("tasks")
 
 
+def way_in(via, ip):
+    """How an agent came in, for the host: the tag and the address."""
+    if via == TOR:
+        return f"{via} (Tor hides the address)"
+    return f"{via} from {ip}" if ip else via or "?"
+
+
 def local_addresses():
     """Addresses agents on other machines can try: LAN first, then the rest
     (Tailscale and the like), then the hostname."""
@@ -1561,7 +1661,7 @@ from textual.coordinate import Coordinate  # noqa: E402
 from textual.screen import ModalScreen  # noqa: E402
 from textual.suggester import Suggester  # noqa: E402
 from textual.widget import Widget  # noqa: E402
-from textual.widgets import Button, DataTable, Footer, Header, Input, RichLog, Static  # noqa: E402
+from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, RichLog, Static  # noqa: E402
 
 COLORS = ["cyan", "green", "yellow", "blue", "bright_cyan", "bright_green", "bright_blue", "bright_yellow"]
 CODE_STYLE = Style(color="bright_cyan", bgcolor="grey19")   # `inline code` in messages
@@ -1876,10 +1976,11 @@ class ActionDialog(ModalScreen):
     #dialog #buttons Button { min-width: 8; margin-right: 1; }
     """
 
-    def __init__(self, title, lines, buttons, confirm=None, note=False, needs_note=()):
+    def __init__(self, title, lines, buttons, confirm=None, note=False, needs_note=(), focus=None):
         super().__init__()
         self.title_text, self.lines, self.buttons = title, lines, buttons
         self.confirm, self.note, self.needs_note = confirm or {}, note, needs_note
+        self.focus_id = focus   # the button that has the focus; else the note or the first one
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -1895,7 +1996,8 @@ class ActionDialog(ModalScreen):
 
     def on_mount(self):
         """The note, or else the first action, has the focus; not the X."""
-        first = self.query("#note") or self.query("#buttons Button")
+        first = self.query(f"#{self.focus_id}") if self.focus_id else None
+        first = first or self.query("#note") or self.query("#buttons Button")
         if first:
             first.first().focus()
 
@@ -1920,11 +2022,124 @@ class ActionDialog(ModalScreen):
         else:
             self.dismiss((action, note))
 
+class AppHeader(Header):
+    """Textual's header with Share on the right, and without its own trick
+    of growing to three lines on a click."""
+
+    DEFAULT_CSS = """
+    AppHeader #share { dock: right; height: 1; min-width: 9; margin-right: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield from super().compose()
+        yield Button("Share", id="share", compact=True, variant="primary",
+                     tooltip="Who can reach this chat: LAN, a Cloudflare tunnel, Tor (/share)")
+
+    def _on_click(self, event):
+        event.prevent_default()   # Textual calls the base class's handler too, which would make it tall
+
+
+class AccessDialog(ModalScreen):
+    """Who can reach the chat: a row per way in, turned on and off here.
+    The app does the work (ServerApp.toggle_access and the rest); the
+    window shows its state twice a second, so a tunnel that's starting
+    shows how far it got."""
+
+    BINDINGS = [Binding("escape", "dismiss(None)", "Close")]
+    CSS = """
+    AccessDialog { align: center middle; }
+    #access { width: 100; max-width: 95%; height: auto; max-height: 90%; border: thick $primary;
+              background: $surface; padding: 0 2 1 2; }
+    #access #top { height: 1; margin-bottom: 1; }
+    #access .title { width: 1fr; text-style: bold; }
+    #access #close { width: 5; min-width: 5; }
+    #access .way { height: auto; margin-top: 1; }
+    #access .tag { width: 7; text-style: bold; color: $accent; }
+    #access .state { width: 1fr; }
+    #access .way Button { min-width: 10; margin-left: 1; }
+    #access #tor-options { height: auto; padding-left: 7; }
+    #access #tor-options Button { margin-left: 1; }
+    #access #hint { margin-top: 1; color: $text-muted; }
+    #access #bottom { height: auto; margin-top: 1; align-horizontal: right; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="access"):
+            with Horizontal(id="top"):
+                yield Static("Share this chat: who can reach it", classes="title")
+                yield Button("✕", id="close", compact=True, tooltip="Close (Escape)")
+            with Horizontal(classes="way"):
+                yield Static(LOCAL, classes="tag")
+                yield Static(Text("This machine: always open, for agents here and the tunnels' way in"),
+                             classes="state")
+            for tag in (LAN, CF, TOR):
+                with Horizontal(classes="way"):
+                    yield Static(tag, classes="tag")
+                    yield Static(id=f"state-{tag}", classes="state")
+                    if tag != LAN:
+                        yield Button("Copy invitation", id=f"copy-{tag}")
+                    yield Button("Turn on", id=f"toggle-{tag}")
+                if tag == TOR:
+                    with Horizontal(id="tor-options"):
+                        yield Checkbox("Same address every time", id="tor-keep")
+                        yield Button("New address", id="tor-new",
+                                     tooltip="Drop the kept key: the next start gets a new onion address")
+            yield Static(Text("Whatever the way in, an agent joins only when you approve it: Mine for "
+                              "your own agents, Guest for someone else's. Compare the pairing code first."),
+                         id="hint")
+            with Horizontal(id="bottom"):
+                yield Button("This machine only", id="only-local", variant="error",
+                             tooltip="Close LAN and the tunnels")
+
+    def on_mount(self):
+        self.show_state()
+        self.set_interval(0.5, self.show_state)
+        self.query_one(f"#toggle-{LAN}", Button).focus()
+
+    def show_state(self):
+        app = self.app
+        for tag in (LAN, CF, TOR):
+            text, on, busy, available = app.access_state(tag)
+            self.query_one(f"#state-{tag}", Static).update(Text(text))
+            toggle = self.query_one(f"#toggle-{tag}", Button)
+            toggle.label = "Turn off" if on or busy else "Turn on"
+            toggle.variant = "warning" if on or busy else "success"
+            toggle.disabled = not (on or busy or available)
+            if tag != LAN:
+                self.query_one(f"#copy-{tag}", Button).disabled = not on
+        keep = self.query_one("#tor-keep", Checkbox)
+        if keep.value != app.tor_keep:
+            with keep.prevent(Checkbox.Changed):
+                keep.value = app.tor_keep
+        self.query_one("#tor-new", Button).disabled = bool(app.tunnels[TOR]) or not app.kept_onion()
+
+    def on_button_pressed(self, event):
+        event.stop()
+        action = event.button.id
+        if action == "close":
+            self.dismiss(None)
+        elif action.startswith("toggle-"):
+            self.app.toggle_access(action.removeprefix("toggle-"))
+        elif action.startswith("copy-"):
+            self.app.show_invitation(action.removeprefix("copy-"))
+        elif action == "tor-new":
+            self.app.new_onion()
+        elif action == "only-local":
+            self.app.only_local()
+        self.show_state()
+
+    def on_checkbox_changed(self, event):
+        event.stop()
+        self.app.set_tor_keep(event.value)
+        self.show_state()
+
 HELP = """\
 Type to write as host. @name wakes only that agent, @all wakes everyone, and
 a message without any @name wakes only the orchestrator (everyone if there's
 none). Tab completes an @name. Commands:
-  /approve [name|code]   /reject [name|code]   (default: the selected request)
+  /approve [name|code] [mine|guest]   /reject [name|code]   (default: the selected request;
+                         mine: your own agent, guest: someone else's; default guest unless LOCAL)
+  /mine NAME   /guest NAME   (change a member's trust)
   /kick [name]   /mute [name]   /unmute [name]  (default: the selected member)
   /stop [name|all]   /go [name|all]   (default: all; commands fail until /go)
   /files   /cancel ID   (offered files and the shared folder: list, delete)
@@ -1934,7 +2149,8 @@ none). Tab completes an @name. Commands:
   /task release ID   /task cancel ID   /tasks [all]
   /role NAME ROLE   /orchestrator [NAME]   (who leads; hand it over)
   /rules [add TEXT | del N | set N TEXT | reset]   /board [TEXT | clear]  (\\n: new line)
-  /public [on|off]   (a Cloudflare quick tunnel for guests; copies the invitation to send them)
+  /share   (who can reach the chat: LAN, a Cloudflare tunnel, Tor; the Share button; also /public)
+  /public off   (close the tunnels at once)
   /copy [N]   (copy code block N, shown as [N]; without N the last one)
   /who   /help   /quit   /restart (update the code and start again; the chat and tasks go on)
 Start a line with // to send a message that begins with /.
@@ -1976,7 +2192,8 @@ class ServerApp(App):
         self.chat = None
         self.request_keys, self.member_keys, self.task_keys, self.file_keys = [], [], [], []
         self.mytask_keys = []
-        self.public = None     # public.Public while /public is on
+        self.tunnels = {CF: None, TOR: None}   # public.Cloudflare and public.Tor while on or starting
+        self.tor_keep = self.load_access().get("tor_keep", True) is not False   # the same onion address each time
         self.blocks, self.inline = {}, {}   # number -> text the TUI copies on click or /copy
 
     def notify(self, message, *, title="", severity="information", timeout=None, markup=False):
@@ -1985,11 +2202,12 @@ class ServerApp(App):
         super().notify(message, title=title, severity=severity, timeout=timeout, markup=markup)
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield AppHeader()
         with Horizontal(id="main"):
             yield ChatLog(id="log", wrap=True, markup=False, highlight=False, min_width=20)
             yield Splitter(id="splitter")
             with Vertical(id="side"):
+                yield Static(id="access-label", classes="label")   # the ways in that are open; Share changes them
                 yield Static("Join requests (click to approve)", classes="label")
                 yield ActionTable(id="requests", cursor_type="row")
                 yield Static("Members (click for actions)", classes="label")
@@ -2015,8 +2233,9 @@ class ServerApp(App):
         yield Footer()
 
     async def on_mount(self):
-        self.query_one("#requests", DataTable).add_columns("Code", "Name", "Machine", "IP")
-        self.query_one("#members", DataTable).add_columns("Name", "Role", "Status", "Wakes")
+        self.query_one("#requests", DataTable).add_columns("Code", "Name", "Via", "Machine")
+        # Status before Via and Role: in a narrow side panel it's the one the host needs
+        self.query_one("#members", DataTable).add_columns("Name", "Status", "Via", "Role", "Wakes")
         self.query_one("#tasks", DataTable).add_columns("ID", "Status", "Owner", "Title")
         self.query_one("#mytasks", DataTable).add_columns("ID", "From", "Title")
         self.query_one("#files", DataTable).add_columns("ID", "Name", "Size", "Shared by")
@@ -2027,20 +2246,35 @@ class ServerApp(App):
         self.chat = ChatServer(a.name, a.port, proto.home(), None if a.no_transcript else a.transcripts,
                                a.listen, self.chat_event, resume=getattr(a, "resume", False),
                                lead=getattr(a, "orchestrator", "") or "")
+        # A new start is this machine only (--lan: and LAN); --resume (so /restart) keeps the ways in as they
+        # were. Without access.json, they were a server older than the Share window's: LAN was open.
+        resume = getattr(a, "resume", False)
+        restore = self.load_access().get("on", []) if resume and self.access_file().exists() else None
+        self.chat.lan = (LAN in restore if isinstance(restore, list) else resume or getattr(a, "lan", False)) \
+            and self.chat.lan_possible
         try:
             await self.chat.start()
         except OSError as e:
             self.exit(message=f"Can't listen on port {a.port}: {e}")
             return
-        where = a.listen or "all interfaces"
-        self.sub_title = f"{a.name} · port {self.chat.port} · key {proto.key_label(self.chat.public)}"
+        self.key_title = f"{a.name} · port {self.chat.port} · key {proto.key_label(self.chat.public)}"
+        self.sub_title = self.key_title
         for message in self.chat.history[-500:]:   # after --resume (/restart): the chat as it was
             self.show_message(message)
         if self.chat.history:
             self.system("--- Server restarted; the chat goes on. ---")
-        self.system(f"Listening on {where}, port {self.chat.port}. /help for commands.")
+        if self.chat.lan:
+            self.system(f"Listening on {a.listen or 'all interfaces'}, port {self.chat.port}. /help for commands.")
+        else:
+            self.system(f"Only this machine reaches the chat (127.0.0.1, port {self.chat.port}). To let other "
+                        "machines or guests in, open LAN, Cloudflare or Tor: Share, top right, or /share. "
+                        "/help for commands.")
         self.system(f"Transcript: {self.chat.transcripts or 'off'}")
         self.write_server_file()
+        self.access_changed()
+        for tag in (CF, TOR):
+            if isinstance(restore, list) and tag in restore:
+                self.run_worker(self.tunnel_on(tag), exit_on_error=False)
         self.set_interval(15, self.refresh_tables)
         self.refresh_tables()
         self.query_one("#input", Input).focus()
@@ -2050,8 +2284,10 @@ class ServerApp(App):
             # The widgets are gone: waits that end while the server stops must
             # not reach them (each one printed a traceback on quit).
             self.chat.notify = lambda kind, data=None: None
-        if self.public:
-            await self.public.stop()
+        for tag, tunnel in self.tunnels.items():
+            if tunnel:
+                self.tunnels[tag] = None
+                await tunnel.stop()
         if self.chat:
             await self.chat.stop()
 
@@ -2170,18 +2406,18 @@ class ServerApp(App):
         if self.chat is None:
             return
         requests = sorted(self.chat.requests.values(), key=lambda r: r.since)
-        self.request_keys = self.fill("requests", [(r.code, r.name, r.host, r.ip) for r in requests],
+        self.request_keys = self.fill("requests", [(r.code, r.name, r.via, r.host) for r in requests],
                                       [r.key for r in requests])
         members = sorted(self.chat.members.values(), key=lambda m: m.name)
         # The console's human first; a click shows their tasks.
         human = self.chat.who()[0]
-        owner = [(Text(human["name"], style="bold " + color_of(human["name"])), human["role"],
-                  Text(human["status"], style="green"), "-")]
+        owner = [(Text(human["name"], style="bold " + color_of(human["name"])), Text(human["status"], style="green"),
+                  LOCAL, human["role"], "-")]
         # No machine column: with the role it pushed the status out of view; the member's window has it.
         self.member_keys = self.fill("members", owner + [(Text(m.name, style="bold " + color_of(m.name)),
-                                                  self.chat.role_of(m.name) or "-",
-                                                  Text(self.chat.status(m) + (", public" if m.ip.endswith(PUBLIC) else ""),
+                                                  Text(self.chat.status(m),
                                                        style=MEMBER_COLORS.get(self.chat.status(m), "")),
+                                                  self.via_cell(m), self.chat.role_of(m.name) or "-",
                                                   m.wakes) for m in members],
                                      [CONSOLE] + [m.key for m in members])
         rows = self.chat.task_rows()[::-1]   # newest first
@@ -2254,6 +2490,13 @@ class ServerApp(App):
         row = self.query_one(f"#{table_id}", DataTable).cursor_row
         return keys[row] if 0 <= row < len(keys) else keys[0]
 
+    def via_cell(self, member):
+        """How it came in, and "guest" for someone else's agent."""
+        cell = Text(member.via or "-")
+        if self.chat._guest(member):
+            cell.append(" guest", style="yellow")
+        return cell
+
     def task_lines(self, task):
         return [f"Task {task.id}: {task.status}   owner {self.owner_label(task)}",
                 f"Title: {task.title}", f"Added by {task.by}, {task.created}",
@@ -2261,16 +2504,22 @@ class ServerApp(App):
 
     def request_lines(self, request):
         return [f"Request: {request.name}   code {request.code}",
-                f"Machine: {request.host}   IP: {request.ip}", f"Folder: {request.cwd}",
-                f"Agent: {request.agent}", f"About: {request.about}"]
+                f"Came in by {way_in(request.via, request.ip)}",   # the server's word, before the agent's
+                f"Machine: {request.host}", f"Folder: {request.cwd}",
+                f"Agent: {request.agent}", f"About: {request.about}", "",
+                "Mine: an agent you control. It sees the shared folder and may lead.",
+                "Guest: someone else's agent. No shared folder, can't lead; others see it's a guest.",
+                "The way in says nothing about whose it is: a LAN can hold strangers' machines too."]
 
     def member_lines(self, member):
         return [f"Member: {member.name}   {self.chat.status(member)}   "
                 f"role: {self.chat.role_of(member.name) or '-'}"
                 + ("   STOPPED" if self.chat.is_stopped(member.name) else "")
                 + ("   muted" if member.muted else ""),
-                f"Machine: {member.host}   IP: {member.ip}", f"Folder: {member.cwd}",
-                f"Agent: {member.agent}", f"Profile: {member.about}", f"Approved: {member.approved}",
+                f"Came in by {way_in(member.via, member.ip)}", f"Machine: {member.host}", f"Folder: {member.cwd}",
+                f"Agent: {member.agent}", f"Profile: {member.about}",
+                f"Approved: {member.approved}, as " + ("a guest (someone else's agent)" if self.chat._guest(member)
+                                                       else "yours"),
                 f"Wake-ups since the server started: {member.wakes}"]
 
     def file_lines(self, f):
@@ -2329,16 +2578,18 @@ class ServerApp(App):
         def done(result):
             if key not in self.chat.requests:
                 self.notify("That request is gone.", severity="warning")
-            elif result[0] == "approve":
-                self.chat.approve(key)
+            elif result[0] in ("mine", "guest"):
+                self.chat.approve(key, guest=result[0] == "guest")
             else:
                 self.system(f"Rejected {self.chat.reject(key).name}.")
             self.refresh_tables()
+        # The focus is on Guest unless the agent runs on this machine: Enter never makes a stranger yours.
         self.open_dialog(ActionDialog(
             f"Join request from {request.name}: compare the code {request.code} with the agent's",
-            self.request_lines(request), [("approve", "Approve", "success"), ("reject", "Reject", "error")],
+            self.request_lines(request), [("mine", "Approve: mine", "success"),
+                                          ("guest", "Approve: guest", "warning"), ("reject", "Reject", "error")],
             confirm={"reject": (f"Reject {request.name}? It can't ask again until the server restarts.",
-                                "Reject")}), done)
+                                "Reject")}, focus="mine" if request.via == LOCAL else "guest"), done)
 
     def member_dialog(self, key):
         if key == CONSOLE:
@@ -2351,8 +2602,10 @@ class ServerApp(App):
         stopped = self.chat.is_stopped(name)
         buttons = [("unmute" if member.muted else "mute", "Unmute" if member.muted else "Mute", "default"),
                    ("go" if stopped else "stop", "Go on" if stopped else "Stop", "warning")]
-        if self.chat.current_orchestrator() != name:
+        if self.chat.current_orchestrator() != name and not self.chat._guest(member):
             buttons.append(("orchestrator", "Make orchestrator", "default"))
+        buttons.append(("mine", "Make mine", "default") if self.chat._guest(member)
+                       else ("guest", "Make guest", "default"))
         buttons.append(("kick", "Remove", "error"))
 
         def done(result):
@@ -2442,6 +2695,8 @@ class ServerApp(App):
         if event.button.id == "open-folder":
             self.run_worker(self.open_folder(), exit_on_error=False)
             self.query_one("#input", ChatInput).focus()
+        elif event.button.id == "share":
+            self.open_access()
 
     async def desktop_open(self, path, what):
         """Hand path to the desktop's app for it (OPENER: gio open)."""
@@ -2493,62 +2748,175 @@ class ServerApp(App):
         elif line:
             self.chat.say(line[1:] if line.startswith("//") else line)
 
-    # --- /public ---
+    # --- access: LAN and the tunnels ---
 
-    def public_command(self, arg):
-        on = bool(self.public and self.public.on)
-        if arg == "on" and not on:
-            if self.public:   # still starting
-                self.notify("Already opening the tunnel.", severity="warning")
-            else:
-                self.run_worker(self.public_on(), exit_on_error=False)
-        elif arg == "off":
-            if self.public:
-                self.run_worker(self.public_off(), exit_on_error=False)
-            else:
-                self.notify("Not public.", severity="warning")
-        elif arg in ("", "on"):
-            if on:
-                self.show_public_line()
-            else:
-                self.system("Not public: only this network reaches the chat. /public on opens a Cloudflare "
-                            "quick tunnel until /public off or /quit.")
-        else:
-            self.notify("Usage: /public [on|off]", severity="warning")
+    def access_file(self):
+        return proto.home() / "access.json"
 
-    async def public_on(self):
-        chat = self.chat
-        self.system("Opening a Cloudflare quick tunnel ...")
-        self.public = public.Public(chat.name, chat.public, self.args.listen or "127.0.0.1", chat.port,
-                                    log=lambda line: self.write_line(Text(line, style="yellow")),
-                                    on_stop=self.public_ended, peers=chat.relayed)
+    def load_access(self):
         try:
-            await self.public.start()
-        except public.PublicError as e:
-            self.public = None
-            self.write_line(Text(f"Not public: {e}", style="red"))
+            saved = json.loads(self.access_file().read_text())
+            return saved if isinstance(saved, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def access_changed(self):
+        """Save the ways in (--resume opens them again) and show them."""
+        on = ([LAN] if self.chat.lan else []) + [tag for tag, t in self.tunnels.items() if t]
+        try:
+            self.access_file().write_text(json.dumps({"on": on, "tor_keep": self.tor_keep}) + "\n")
+        except OSError:
+            pass
+        shown = [LOCAL] + [tag if tag == LAN or self.tunnels[tag].on else f"{tag} (starting)" for tag in on]
+        self.query_one("#access-label", Static).update(f"Open to: {' · '.join(shown)}")
+        public_on = any(t and t.on for t in self.tunnels.values())
+        self.sub_title = self.key_title + (" · PUBLIC" if public_on else "")
+
+    def access_state(self, tag):
+        """For the Share window: (what it shows, on, starting, can be turned on)."""
+        if tag == LAN:
+            if not self.chat.lan_possible:
+                return f"LAN and VPNs: closed (--listen {self.args.listen} is this machine only)", False, False, False
+            if not self.chat.lan:
+                return "LAN and VPNs: closed", False, False, True
+            where = self.args.listen or ", ".join(local_addresses()[:3])
+            return f"LAN and VPNs: open on {where}, port {self.chat.port}", True, False, True
+        tunnel, cls = self.tunnels[tag], public.Cloudflare if tag == CF else public.Tor
+        title = "Cloudflare quick tunnel" if tag == CF else "Tor onion service"
+        if tunnel and tunnel.on:
+            return f"{title}: open at {tunnel.url if tag == CF else tunnel.address}", True, False, True
+        if tunnel:
+            return f"{title}: {tunnel.progress or 'starting'} ...", False, True, True
+        if not cls.installed():
+            return f"{title}: {cls.program} isn't installed ({cls.install})", False, False, False
+        if tag == CF:
+            return f"{title}: closed. No account needed; a new address each time", False, False, True
+        kept = self.kept_onion()
+        when = (f"opens again at {kept}" if kept and self.tor_keep else
+                "opens at a new address, kept from then on" if self.tor_keep else "a new address each time")
+        return f"{title}: closed; {when}. Guests need Tor", False, False, True
+
+    def open_access(self):
+        if not isinstance(self.screen, ModalScreen):
+            self.push_screen(AccessDialog(), lambda result: self.query_one("#input", ChatInput).focus())
+
+    def connected_through(self, tag):
+        return [m.name for m in self.chat.members.values() if m.via == tag and self.chat.status(m) == "online"]
+
+    def toggle_access(self, tag):
+        """The Share window's Turn on / Turn off. Closing a way in that
+        members are connected through asks first."""
+        on = self.chat.lan if tag == LAN else bool(self.tunnels[tag])
+        if not on:
+            self.run_worker(self.lan_set(True) if tag == LAN else self.tunnel_on(tag), exit_on_error=False)
             return
-        self.sub_title += " · PUBLIC"
-        self.show_public_line()
 
-    def show_public_line(self):
-        message = public.invitation(self.public.url, self.chat.public)
-        self.write_line(Text(f"Public at {self.public.url} until /public off. Send this to a guest "
-                             "(copied); check their pairing code with them before approving:", style="bold yellow"))
+        def close(yes=True):
+            if yes:
+                self.run_worker(self.lan_set(False) if tag == LAN else self.tunnel_off(tag), exit_on_error=False)
+        here = self.connected_through(tag)
+        if here:
+            self.push_screen(ConfirmDialog(f"{', '.join(here)} came in by {tag}. Close {tag}? They lose "
+                                           "the connection until it's open again.", f"Close {tag}"), close)
+        else:
+            close()
+
+    def only_local(self):
+        here = [n for tag in (LAN, CF, TOR) for n in self.connected_through(tag)]
+
+        def close(yes=True):
+            if yes:
+                self.run_worker(self.lan_set(False), exit_on_error=False)
+                self.close_tunnels()
+        if here:
+            self.push_screen(ConfirmDialog(f"{', '.join(here)} came in from other machines. Close LAN and "
+                                           "the tunnels? They lose the connection.", "This machine only"), close)
+        else:
+            close()
+
+    def close_tunnels(self):
+        if not any(self.tunnels.values()):
+            self.notify("No tunnel is open.", severity="warning")
+        for tag, tunnel in self.tunnels.items():
+            if tunnel:
+                self.run_worker(self.tunnel_off(tag), exit_on_error=False)
+
+    async def lan_set(self, on):
+        try:
+            await self.chat.set_lan(on)
+        except OSError as e:
+            self.write_line(Text(f"Couldn't open LAN: {e}", style="red"))
+        else:
+            self.system(f"LAN is open: other machines reach the chat on {self.args.listen or 'all interfaces'}, "
+                        f"port {self.chat.port}." if on else
+                        "LAN is closed: only this machine and the tunnels that are open reach the chat.")
+        self.write_server_file()
+        self.access_changed()
+
+    async def tunnel_on(self, tag):
+        if self.tunnels[tag]:
+            self.notify(f"{tag} is already {'open' if self.tunnels[tag].on else 'starting'}.", severity="warning")
+            return
+        chat = self.chat
+        extra = {"folder": proto.home() / "tor", "keep": self.tor_keep} if tag == TOR else {}
+        tunnel = (public.Cloudflare if tag == CF else public.Tor)(
+            "127.0.0.1", chat.port, log=lambda line: self.write_line(Text(line, style="yellow")),
+            on_stop=lambda: self.tunnel_ended(tag, tunnel), peers=chat.relayed, **extra)
+        self.tunnels[tag] = tunnel
+        self.system(f"Opening {tunnel.name} ...")
+        self.access_changed()
+        try:
+            await tunnel.start()
+        except public.PublicError as e:
+            if self.tunnels[tag] is tunnel:   # not closed by the host meanwhile
+                self.tunnels[tag] = None
+                self.write_line(Text(f"Couldn't open {tunnel.name}: {e}", style="red"))
+                self.access_changed()
+            return
+        self.access_changed()
+        self.show_invitation(tag)
+
+    def show_invitation(self, tag):
+        tunnel = self.tunnels[tag]
+        if not (tunnel and tunnel.on):
+            self.notify(f"{tag} isn't open.", severity="warning")
+            return
+        message = public.invitation(tunnel.address, self.chat.public)
+        self.write_line(Text(f"{tag} is open at {tunnel.url if tag == CF else tunnel.address} until you close it "
+                             "(/share). Send this to a guest (copied); check their pairing code with them before "
+                             "approving:", style="bold yellow"))
         self.write_line(Text(message))
-        self.copy_text(message)
+        self.copy_text(message, "the invitation")
 
-    async def public_off(self):
-        pub, self.public = self.public, None
-        await pub.stop()
-        self.sub_title = self.sub_title.replace(" · PUBLIC", "")
-        self.system("Not public any more: the tunnel and the gateway are closed.")
+    async def tunnel_off(self, tag):
+        tunnel, self.tunnels[tag] = self.tunnels[tag], None
+        self.access_changed()
+        if tunnel:
+            await tunnel.stop()
+            self.system(f"{tag} is closed: {tunnel.name} and its relay are stopped.")
 
-    def public_ended(self):
-        """cloudflared ended by itself; Public has said so in the log."""
-        self.public = None
-        self.sub_title = self.sub_title.replace(" · PUBLIC", "")
-        self.bell()
+    def tunnel_ended(self, tag, tunnel):
+        """The tunnel's process ended by itself; the tunnel has said so in the log."""
+        if self.tunnels[tag] is tunnel:
+            self.tunnels[tag] = None
+            self.access_changed()
+            self.bell()
+
+    def kept_onion(self):
+        return public.Tor("127.0.0.1", 0, None, folder=proto.home() / "tor").kept_address()
+
+    def set_tor_keep(self, keep):
+        self.tor_keep = keep
+        if self.tunnels[TOR]:   # takes effect when it closes: the key goes then
+            self.tunnels[TOR].keep = keep
+        self.access_changed()
+
+    def new_onion(self):
+        if self.tunnels[TOR]:
+            self.notify("Close Tor first.", severity="warning")
+            return
+        public.Tor("127.0.0.1", 0, None, folder=proto.home() / "tor").forget()
+        self.system("Tor's kept address is gone: it opens at a new one.")
 
     def find_request(self, arg):
         for r in self.chat.requests.values():
@@ -2561,13 +2929,28 @@ class ServerApp(App):
         arg = arg.strip().lstrip("@")
         chat = self.chat
         if name in ("approve", "reject"):
-            key = self.find_request(arg) if arg else self.selected("requests")
+            who, _, trust = arg.partition(" ")   # mine and guest are reserved, never an agent's name
+            if trust not in ("", "mine", "guest") or (trust and name == "reject"):
+                self.notify(f"Usage: /{name} [name|code]" + (" [mine|guest]" if name == "approve" else ""),
+                            severity="warning")
+                return
+            key = self.find_request(who) if who else self.selected("requests")
             if key is None:
-                self.notify("No such join request." if arg else "No join requests.", severity="warning")
+                self.notify("No such join request." if who else "No join requests.", severity="warning")
             elif name == "approve":
-                chat.approve(key)
+                chat.approve(key, guest=None if not trust else trust == "guest")
             else:
                 self.system(f"Rejected {chat.reject(key).name}.")
+        elif name in ("mine", "guest"):
+            member = chat.by_name(arg) if arg else None   # a name, always: no selected row by accident
+            if member is None:
+                self.notify(f"Usage: /{name} NAME", severity="warning")
+            else:
+                chat.set_guest(member.name, name == "guest")
+        elif name in ("share", "access") or (name == "public" and arg in ("", "on")):
+            self.open_access()
+        elif name == "public" and arg == "off":
+            self.close_tunnels()
         elif name in ("kick", "mute", "unmute"):
             member = chat.by_name(arg) if arg else chat.members.get(self.selected("members"))
             if member is None:   # the console's own row is first in Members
@@ -2620,7 +3003,7 @@ class ServerApp(App):
         elif name == "rules":
             self.rules_command(arg)
         elif name == "public":
-            self.public_command(arg)
+            self.notify("Usage: /share, or /public off to close the tunnels", severity="warning")
         elif name == "board":
             if not arg:
                 self.system(chat.room_text())
@@ -2722,7 +3105,8 @@ class ServerApp(App):
         path = proto.servers_dir() / f"{chat.name}.json"
         record = {"name": chat.name, "port": chat.port, "public_key": proto.b64(chat.public),
                   "fingerprint": proto.fingerprint(chat.public),
-                  "addresses": [self.args.listen] if self.args.listen else local_addresses()}
+                  "addresses": (([self.args.listen] if self.args.listen else local_addresses())
+                                if chat.lan else ["127.0.0.1"])}
         try:
             old = json.loads(path.read_text())
         except (OSError, ValueError):
@@ -2740,6 +3124,8 @@ class ServerApp(App):
             except OSError as e:
                 self.write_line(Text(f"Couldn't write the server file {path} ({e}); agents on this machine "
                                      "need --address to find the server.", style="red"))
+        if not chat.lan:
+            return
         unspecified = self.args.listen in ("0.0.0.0", "::")
         address = ((local_addresses() if unspecified else record["addresses"]) or ["HOST"])[0]
         port = "" if chat.port == proto.DEFAULT_PORT else f":{chat.port}"
@@ -2783,7 +3169,9 @@ def main():
                    help="server name, also its server file <name>.json (default: this machine's hostname)")
     p.add_argument("--port", type=int, default=proto.DEFAULT_PORT, help=f"port to listen on (default: {proto.DEFAULT_PORT})")
     p.add_argument("--listen", metavar="ADDRESS", default=None,
-                   help="address to listen on (default: all interfaces)")
+                   help="where LAN opens (default: all interfaces); this machine (127.0.0.1) is always open")
+    p.add_argument("--lan", action="store_true",
+                   help="open LAN at start (default: only this machine; open LAN, Cloudflare or Tor in the TUI)")
     p.add_argument("--orchestrator", metavar="NAME", default="",
                    help="this agent holds the orchestrator role whenever it's a member, and can always take it back")
     p.add_argument("--transcripts", metavar="DIR", default=os.environ.get("INTER_AGENT_COMM_TRANSCRIPTS"),

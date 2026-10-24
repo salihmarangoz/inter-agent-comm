@@ -25,7 +25,7 @@ AGENTS = [  # name, machine, agent, profile
     ("windows.app", "win-box", "Claude Code", "T1: the installer"),
     ("mac.app", "mac-box", "Codex", "T2: signing and notarization"),
 ]
-WAITING = ("ci.app", "build-box", "Codex", "the release builds")
+WAITING = ("beta.tester", "laptop", "Claude Code", "a beta tester's agent, through Tor")
 
 
 async def main():
@@ -38,21 +38,22 @@ async def main():
     key.parent.mkdir(parents=True)
     key.write_text(proto.b64(bytes(range(32))) + "\n")
     key.chmod(0o600)
-    args = argparse.Namespace(name="workstation", port=0, listen="127.0.0.1", orchestrator="linux.app",
+    # LAN open, as it is once the host lets the other machines in (it listens for a moment, on a free port)
+    args = argparse.Namespace(name="workstation", port=0, listen=None, lan=True, orchestrator="linux.app",
                               no_transcript=True, transcripts=None)
     app = server.ServerApp(args)
     async with app.run_test(size=(160, 44)) as pilot:
         await pilot.pause()
         chat = app.chat
 
-        def join(name, machine, agent, about, ip):
+        def join(name, machine, agent, about, ip, via=proto.LAN):
             key = proto.public_key(secrets.token_bytes(32))
             hello = {"name": name, "host": machine, "cwd": "/home/dev/app", "agent": agent, "about": about}
-            chat._join(proto.b64(key), key, hello, ip)
+            chat._join(proto.b64(key), key, hello, ip, via)
             return proto.b64(key)
 
         for i, (name, machine, agent, about) in enumerate(AGENTS):
-            chat.approve(join(name, machine, agent, about, f"192.0.2.{11 + i}"))
+            chat.approve(join(name, machine, agent, about, f"192.0.2.{11 + i}"), guest=False)
         chat.say("@all Today we release 0.3 of the app on Linux, Windows and macOS. @linux.app, split it up "
                  "please.")
         for title, to in (("Windows installer: pick the folder, keep settings on upgrade", "windows.app"),
@@ -71,7 +72,7 @@ async def main():
         chat._post("mac.app", "Notarization passed. Sharing app-0.3.dmg next; @windows.app no Windows changes "
                               "from my side.")
         chat.say("Nice work. @windows.app please test a clean install too, then we tag 0.3.")
-        join(*WAITING, "198.51.100.7")
+        join(*WAITING, "", proto.TOR)
         await pilot.pause(0.5)
         app.sub_title = app.sub_title.replace(f"port {chat.port}", f"port {proto.DEFAULT_PORT}")
         app.refresh_tables()

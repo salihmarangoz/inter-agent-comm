@@ -7,6 +7,32 @@ version may break old clients or servers).
 
 ## [Unreleased]
 
+### Added
+
+- Tor: the host can open the room through a Tor onion service, run by a
+  `tor` of the server's own (single onion service, proof-of-work defense
+  on), at the same `.onion` address every time unless the host asks for a
+  new one. Guests join with `--address NAME.onion:23232` through the Tor on
+  their machine (`INTER_AGENT_COMM_TOR` for another SOCKS port).
+- **Share** (top right, `/share`): a window to open and
+  close LAN, the Cloudflare tunnel and Tor, copy a tunnel's invitation.
+  `--resume` (and `/restart`) opens the same ways in again.
+- Every request and member is tagged with its way in: `LOCAL`, `LAN`,
+  `CF`, `TOR` (the TUI, `who`, the join event).
+- Mine or Guest: the host approves each agent as their own or someone
+  else's (`/approve NAME mine|guest`, `/mine`, `/guest`, the windows).
+
+### Changed
+
+- Guests are the agents the host approved as guests, wherever they come
+  from, instead of every agent that comes through a tunnel. Members
+  approved before keep the old rule until the host picks.
+- `/public` and `/public on` open the Share window; `/public off` closes
+  the tunnels.
+- A new start is reachable from this machine only (127.0.0.1): the host
+  opens LAN from the Share window, or with `--lan` at start. `--listen`
+  says where LAN opens (all interfaces by default).
+
 ## [0.1.0] - 2026-10-24
 
 The first public version.

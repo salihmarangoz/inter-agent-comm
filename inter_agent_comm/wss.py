@@ -34,6 +34,7 @@ MAX_OPEN = 100            # all visitors together (a quick tunnel takes 200)
 MAX_MESSAGE = 1 << 20     # bytes in one WebSocket message; frames are under 64 KiB
 CHUNK = 65536
 UNREACHABLE = 1011        # close code: the gateway can't reach the chat server
+CF = "CF"                 # the way in the gateway records for the server (proto.CF)
 
 
 def _ws_options():
@@ -117,7 +118,7 @@ class Gateway:
 
     def __init__(self, upstream_host, upstream_port, log=None, trace=None, peers=None):
         self.upstream = (upstream_host, upstream_port)
-        # (host, port) of each upstream connection's own end -> its visitor, so
+        # (host, port) of each upstream connection's own end -> ("CF", its visitor), so
         # a server in this process can tell tunnelled agents from local ones.
         self.peers = {} if peers is None else peers
         # A table given by the chat server is cleaned by the server when it's done with each
@@ -218,7 +219,7 @@ class Gateway:
             return
         self.trace(f"{ip}: connected")
         local = tuple(writer.get_extra_info("sockname")[:2])
-        self.peers[local] = ip   # before any byte goes up, so before the server's handshake ends
+        self.peers[local] = (CF, ip)   # before any byte goes up, so before the server's handshake ends
         try:
             await self._pipe(ws, reader, writer)
         finally:

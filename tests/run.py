@@ -678,7 +678,11 @@ async def tui_test(tmp):
         await pilot.pause()
         check("one click on a join request opens its dialog", isinstance(app.screen, server.ActionDialog),
               app.screen)
-        await pilot.click("#approve")
+        check("an agent on this machine: the window has Mine focused, and says how it came in",
+              isinstance(app.screen, server.ActionDialog) and app.screen.focused is not None
+              and app.screen.focused.id == "mine" and "Came in by LOCAL" in "\n".join(app.screen.lines),
+              app.screen.focused)
+        await pilot.click("#mine")
         await pilot.pause()
         requests = app.query_one("#requests")
         blurred = requests.get_component_rich_style("datatable--cursor")
@@ -686,9 +690,9 @@ async def tui_test(tmp):
               app.query_one("#input").has_focus and not requests.has_focus
               and (blurred.bgcolor is None or blurred.bgcolor == requests.rich_style.bgcolor),
               (blurred, requests.rich_style))
-        check("its Approve button approves it",
-              app.chat.by_name("agent-d") is not None and not isinstance(app.screen, server.ModalScreen),
-              app.screen)
+        check("its Approve: mine button approves it as the host's own",
+              app.chat.by_name("agent-d") is not None and app.chat.by_name("agent-d").guest is False
+              and not isinstance(app.screen, server.ModalScreen), app.screen)
         box = app.query_one("#input")
         box.value = "hi @age"
         await pilot.pause()
@@ -845,7 +849,7 @@ async def tui_test(tmp):
               (app.screen, app.chat.board["T1"].status))
         members = app.query_one("#members")
         check("the console's human is the first member, as human (server)",
-              app.member_keys[0] == "host" and str(members.get_cell_at(Coordinate(0, 1))) == "human (server)",
+              app.member_keys[0] == "host" and str(members.get_cell_at(Coordinate(0, 3))) == "human (server)",
               app.member_keys)
         await pilot.click("#members", offset=(2, 1))
         await pilot.pause()
@@ -1032,10 +1036,18 @@ async def tui_test(tmp):
         widest = max(strip.cell_length for strip in log.lines)
         check("the chat wraps again at its new width", widest <= log.scrollable_content_region.width,
               (widest, log.scrollable_content_region.width))
-        listening = sum(strip.text.startswith("Listening on") for strip in log.lines)
+        listening = sum(strip.text.startswith("Only this machine reaches") for strip in log.lines)
         check("and shows the lines written before the first resize once", listening == 1, listening)
-        labels = [w.region.y for w in app.query(".label")]
+        labels = [w.region.y for w in app.query(".label") if w.id != "access-label"]   # a line, no table
         check("a blank line above each table's title", all(b - a > 2 for a, b in zip(labels, labels[1:])), labels)
+        header = app.query_one(server.AppHeader)
+        for offset in ((20, 0), (40, 0)):   # the title; the icon at the left opens the command palette
+            await pilot.click(server.AppHeader, offset=offset)
+            await pilot.pause()
+        check("a click on the title bar doesn't make it grow",
+              header.region.height == 1 and not header.has_class("-tall"), header.region)
+        check("the ways in are on top, a blank line above the requests",
+              labels[0] - app.query_one("#access-label").region.y == 2, labels)
         exits = []
         real_exit, app.exit = app.exit, lambda *a, **kw: exits.append(kw.get("return_code"))
         app.command("/restart")
@@ -1524,11 +1536,9 @@ def restart_op_tests(tmp):
     class Writer:
         def get_extra_info(self, what):
             return ("192.0.2.10", 23232)
-    conn = type("FakeConn", (), {"writer": Writer()})()
-    check("same_machine: its own address and loopback yes; another host or a /public guest no",
-          server.same_machine(conn, "192.0.2.10") and server.same_machine(conn, "127.0.0.1")
-          and not server.same_machine(conn, "192.0.2.110")
-          and not server.same_machine(conn, "127.0.0.1" + server.PUBLIC))
+    check("same_machine: its own address and loopback yes; another host no",
+          server.same_machine(Writer(), "192.0.2.10") and server.same_machine(Writer(), "127.0.0.1")
+          and not server.same_machine(Writer(), "192.0.2.110"))
 
 
 def hardening_tests(tmp):
@@ -1564,9 +1574,9 @@ def hardening_tests(tmp):
                   "do it" in r.stdout and not forged(r.stdout), r.stdout)
 
         h.call(h.server.handover, proto.CONSOLE, "dev-b")
-        h.call(lambda: setattr(h.server.by_name("dev-a"), "ip", "203.0.113.5 (public)"))
+        h.call(h.server.set_guest, "dev-a", True)
         r = h.call(h.server.handover, proto.CONSOLE, "dev-a")
-        check("a guest through /public can't be handed the orchestrator role",
+        check("a guest can't be handed the orchestrator role",
               r["type"] == "error" and r["code"] == "guest", r)
         h.call(lambda: setattr(h.server, "orchestrator", ""))
         r = h.call(h.server.set_role, "dev-a", "orchestrator")
@@ -1574,7 +1584,13 @@ def hardening_tests(tmp):
         h.call(lambda: setattr(h.server, "lead", "dev-a"))
         check("nor hold it as the --orchestrator agent", h.call(h.server.current_orchestrator) == "")
         h.call(lambda: setattr(h.server, "lead", "lead"))
-        h.call(lambda: setattr(h.server.by_name("dev-a"), "ip", "127.0.0.1"))
+        h.call(h.server.handover, proto.CONSOLE, "dev-b")
+        h.call(h.server.set_guest, "dev-b", True)
+        check("an orchestrator the host makes a guest gives the role back",
+              h.call(h.server.current_orchestrator) != "dev-b")
+        h.call(h.server.set_guest, "dev-b", False)
+        h.call(h.server.set_guest, "dev-a", False)
+        h.call(lambda: setattr(h.server, "orchestrator", ""))
 
         c = tmp / "c"
         codes = [re.search(r"Pairing code: (\d{3}-\d{3})", chat(c, h.servers, "-n", "dev-c", "join").stdout)
@@ -1874,6 +1890,8 @@ def main():
     asyncio.run(tui_test(tmp))
     from test_gateway import run_checks as gateway_checks   # it imports this module
     check("WebSocket gateway, /public and join limits (test_gateway.py)", gateway_checks())
+    from test_access import run_checks as access_checks
+    check("Tor, LAN on and off, Mine or Guest, the Share window (test_access.py)", access_checks())
     print()
     if failures:
         print(f"{len(failures)} failed")
