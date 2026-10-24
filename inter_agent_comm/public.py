@@ -141,7 +141,8 @@ class Relay:
                 self.log(f"the chat server isn't reachable ({e or type(e).__name__})")
                 return
             local = tuple(up_writer.get_extra_info("sockname")[:2])
-            self.peers[local] = (proto.TOR, "")   # before any byte goes up
+            # before any byte goes up; a list, so each entry is its own object (see wss.forget_later)
+            entry = self.peers[local] = [proto.TOR, ""]
             try:
                 await _pipe(reader, writer, up_reader, up_writer)
             finally:
@@ -149,6 +150,8 @@ class Relay:
         finally:
             if local and self.owns_peers:
                 self.peers.pop(local, None)
+            elif local:
+                wss.forget_later(self.peers, local, entry)
             self.open.discard(writer)
             writer.close()
 
@@ -230,21 +233,29 @@ class Tunnel:
                 raise closed
             self.relay = relay
             try:
+                command = self._command(port)
+            except OSError as e:   # its folder: not ours (after a sudo), or a file
+                await self._stop_relay()
+                raise PublicError(f"couldn't prepare {self.program}'s files ({e})") from None
+            try:
                 process = await asyncio.create_subprocess_exec(
-                    *self._command(port), stdin=asyncio.subprocess.DEVNULL,
+                    *command, stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE if self.output == "stdout" else asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE if self.output == "stderr" else asyncio.subprocess.DEVNULL,
                     preexec_fn=_die_with_parent if sys.platform.startswith("linux") else None)
             except FileNotFoundError:
                 await self._stop_relay()
                 raise PublicError(f"{self.program} isn't installed ({self.install})") from None
+            except OSError as e:
+                await self._stop_relay()
+                raise PublicError(f"couldn't start {self.program} ({e})") from None
             if epoch != self._epoch:   # stop() has stopped the relay
                 await _end(process)
                 raise closed
             self.process = process
             try:
                 address = await asyncio.wait_for(self._ready(process), self.timeout)
-            except (asyncio.TimeoutError, PublicError) as e:
+            except (asyncio.TimeoutError, PublicError, ValueError) as e:   # ValueError: a line too long
                 if epoch != self._epoch:
                     raise closed from None
                 await self.stop()
@@ -272,7 +283,13 @@ class Tunnel:
     async def _watch(self, process):
         """Drain the process's output and notice when it exits on its own."""
         stream = getattr(process, self.output)
-        while line := await stream.readline():
+        while True:
+            try:
+                line = await stream.readline()
+            except ValueError:   # a line over the stream's limit: skipped, the rest still read
+                continue
+            if not line:
+                break
             if self._is_error(line):
                 self.log(f"{self.program}: {line.decode(errors='replace').strip()[-200:]}")
         code = await process.wait()
@@ -336,6 +353,24 @@ class Cloudflare(Tunnel):
         self.url = None
 
 
+def tor_folder():
+    """The server's own Tor: its data, its onion key (onion/) and an empty torrc."""
+    return proto.home() / "tor"
+
+
+def kept_onion(folder=None):
+    """The onion address a start would use: the kept key's, if any."""
+    try:
+        return ((folder or tor_folder()) / "onion" / "hostname").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def forget_onion(folder=None):
+    """A new address next time: drop the kept key."""
+    shutil.rmtree((folder or tor_folder()) / "onion", ignore_errors=True)
+
+
 def tor_version():
     """tor's version as a tuple, (0,) if it doesn't say: proof-of-work came in 0.4.8."""
     try:
@@ -363,7 +398,7 @@ class Tor(Tunnel):
 
     def __init__(self, *args, folder=None, keep=True, **kwargs):
         super().__init__(*args, **kwargs)
-        self.folder = Path(folder) if folder else proto.home() / "tor"
+        self.folder = Path(folder) if folder else tor_folder()
         self.keep = keep
         self.pow = False   # tor has proof-of-work defenses (0.4.8 and later); asked at each start
 
@@ -372,15 +407,10 @@ class Tor(Tunnel):
         return self.folder / "onion"
 
     def kept_address(self):
-        """The onion address a start would use: the kept key's, if any."""
-        try:
-            return (self.key_dir / "hostname").read_text().strip() or None
-        except OSError:
-            return None
+        return kept_onion(self.folder)
 
     def forget(self):
-        """A new address next time: drop the kept key."""
-        shutil.rmtree(self.key_dir, ignore_errors=True)
+        forget_onion(self.folder)
 
     async def _start_relay(self):
         # tor --version off the event loop: a slow tor mustn't hold up the chat

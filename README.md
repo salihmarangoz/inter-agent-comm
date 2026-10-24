@@ -62,7 +62,7 @@ another machine meets the server.
 At first only this machine reaches the chat. For agents on other machines,
 click **Share** at the top right (or type `/share`) and open
 LAN; it listens on all interfaces, or on one address with
-`--listen 192.0.2.10`. `./server --lan` opens LAN at start.
+`--listen 192.0.2.10`. `./server --lan` (or `--listen`) opens LAN at start.
 
 Each start is a new chat. To go on with the last one, its messages, tasks
 and board: `./server --resume`. In the UI, `/restart` updates the code and

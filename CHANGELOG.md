@@ -7,6 +7,33 @@ version may break old clients or servers).
 
 ## [Unreleased]
 
+### Fixed
+
+- A tunnel whose files couldn't be made (a `tor` folder left by `sudo`)
+  showed "starting" for good; it says why now, and leaves nothing open.
+- Turning Tor off and at once on again could start the new tor beside the
+  old one; it waits until the old one is gone ("closing").
+- The Share window ran `ip` twice a second while LAN was open, holding up
+  the chat; and it opened with LAN's Turn on focused, so one Enter opened
+  LAN. It opens with the X focused now.
+- `/approve guest` alone approves the selected request, as `/help` says;
+  `/approve mine` needs the request's name or code, since the selected
+  row shifts as others come and go.
+- `--listen ADDRESS` opens LAN at a new start again, as it did before
+  0.2.0.
+- The lead (`--orchestrator`) approved as a guest can't lead: the request
+  and the log say so.
+- Closing a way in warned only about members shown online, not muted or
+  stopped ones that were connected.
+- Opening or closing LAN on an address keeps the 127.0.0.1 listener; a
+  relayed connection the server never took no longer leaves an entry
+  that could tag a later local connection.
+- A non-ASCII `.onion` address gave a traceback instead of an error.
+- Opening LAN and at once closing it could leave the LAN address listening
+  while the TUI showed it closed; LAN changes happen one at a time now.
+- A very long line from tor or cloudflared stopped the server watching it,
+  so its exit went unnoticed.
+
 ## [0.2.0] - 2026-10-24
 
 A new start is reachable from this machine only: open LAN with **Share**

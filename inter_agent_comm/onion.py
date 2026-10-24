@@ -50,6 +50,12 @@ def connect(host, port, timeout=TIMEOUT):
     """A socket to host:port through Tor. Raises OSError, with what to do,
     when there's no Tor here or the onion service doesn't answer."""
     timeout = max(timeout, TIMEOUT)
+    try:
+        name = host.encode("ascii")
+    except UnicodeEncodeError:
+        raise OSError(f"{host!r} isn't an onion address: they're plain letters and digits") from None
+    if len(name) > 255 or not 0 < port < 65536:
+        raise OSError(f"{host}:{port} isn't an onion address and port")
     tried = []
     for proxy in proxies():
         try:
@@ -61,7 +67,6 @@ def connect(host, port, timeout=TIMEOUT):
             sock.sendall(b"\x05\x01\x00")   # SOCKS5, no authentication
             if _recv_exact(sock, 2) != b"\x05\x00":
                 raise OSError(f"{proxy[0]}:{proxy[1]} isn't Tor's SOCKS port")
-            name = host.encode("ascii")
             sock.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + struct.pack(">H", port))
             version, reply, _, kind = _recv_exact(sock, 4)
             if version != 5:

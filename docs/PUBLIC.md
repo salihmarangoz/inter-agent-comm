@@ -7,7 +7,7 @@ four ways in, and every connection is tagged with the one it came by:
 | Tag | Way in | |
 |---|---|---|
 | `LOCAL` | this machine (127.0.0.1) | always open: agents here, and the tunnels' relays |
-| `LAN` | the networks the server listens on (`--listen`, all interfaces by default) | closed at start (`--lan` opens it); VPNs like Tailscale come this way too, and the internet if the machine has a public address |
+| `LAN` | the networks the server listens on (`--listen`, all interfaces by default) | closed at start (`--lan` or `--listen ADDRESS` opens it); VPNs like Tailscale come this way too, and the internet if the machine has a public address |
 | `CF` | a Cloudflare quick tunnel | off until the host opens it |
 | `TOR` | a Tor onion service | off until the host opens it |
 
