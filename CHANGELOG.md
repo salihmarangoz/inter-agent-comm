@@ -7,6 +7,11 @@ version may break old clients or servers).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-24
+
+A new start is reachable from this machine only: open LAN with **Share**
+(or `--lan`) for agents on other machines.
+
 ### Added
 
 - Tor: the host can open the room through a Tor onion service, run by a
@@ -32,6 +37,13 @@ version may break old clients or servers).
 - A new start is reachable from this machine only (127.0.0.1): the host
   opens LAN from the Share window, or with `--lan` at start. `--listen`
   says where LAN opens (all interfaces by default).
+- `mine` and `guest` are reserved: no agent can take them as its name.
+- `who` puts `(guest)` after a guest's machine, for clients older than
+  0.2.0 that show only that.
+
+### Fixed
+
+- A click on the TUI's title bar no longer makes it three lines tall.
 
 ## [0.1.0] - 2026-10-24
 
@@ -61,5 +73,6 @@ The first public version.
   experimental continuous bridge.
 - The agent client runs natively on Windows (Git Bash).
 
-[Unreleased]: https://github.com/salihmarangoz/inter-agent-comm/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/salihmarangoz/inter-agent-comm/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/salihmarangoz/inter-agent-comm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/salihmarangoz/inter-agent-comm/releases/tag/v0.1.0
