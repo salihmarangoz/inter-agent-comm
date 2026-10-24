@@ -116,7 +116,8 @@ def forget_later(peers, local, entry):
     listener closing, say). Left there, it would tag an unrelated local
     connection from the same port. Popping it now could beat the server's
     own lookup, which comes after the handshake, so it waits RELAYED_GRACE;
-    and it drops only this entry, not a new one for the same port."""
+    and it drops only this entry, not a new one for the same port: entries
+    are lists, each its own object (equal tuples of constants are one)."""
     def drop():
         if peers.get(local) is entry:
             del peers[local]
@@ -132,7 +133,7 @@ class Gateway:
 
     def __init__(self, upstream_host, upstream_port, log=None, trace=None, peers=None):
         self.upstream = (upstream_host, upstream_port)
-        # (host, port) of each upstream connection's own end -> ("CF", its visitor), so
+        # (host, port) of each upstream connection's own end -> ["CF", its visitor], so
         # a server in this process can tell tunnelled agents from local ones.
         self.peers = {} if peers is None else peers
         # A table given by the chat server is cleaned by the server when it's done with each
@@ -233,7 +234,8 @@ class Gateway:
             return
         self.trace(f"{ip}: connected")
         local = tuple(writer.get_extra_info("sockname")[:2])
-        entry = self.peers[local] = (CF, ip)   # before any byte goes up, so before the server's handshake ends
+        # before any byte goes up, so before the server's handshake ends; a list: each entry its own object
+        entry = self.peers[local] = [CF, ip]
         try:
             await self._pipe(ws, reader, writer)
         finally:

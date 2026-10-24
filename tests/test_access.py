@@ -45,6 +45,12 @@ if not os.path.exists(host):
 print("Oct 24 00:00:00.000 [notice] Bootstrapped 100% (done): Done", flush=True)
 print("Oct 24 00:00:01.000 [info] handle_response_upload_hsdesc(): Uploaded hidden service descriptor "
       "(status 200 (\\"HS descriptor stored successfully.\\"))", flush=True)
+if os.environ.get("FAKE_TOR_LONG"):   # a line over the reader's limit, then an error, then gone
+    time.sleep(0.5)
+    print("x" * 200000, flush=True)
+    print("Oct 24 00:00:02.000 [err] something went wrong", flush=True)
+    time.sleep(0.5)
+    sys.exit(1)
 time.sleep(600)
 """
 
@@ -276,6 +282,19 @@ def tor_tunnel_checks(tmp, h):
         while not stopped and time.time() < deadline:
             time.sleep(0.1)
         check("tor dying closes it and tells the TUI", stopped and not tor.on and tor.relay is None)
+        os.environ["FAKE_TOR_LONG"] = "1"
+        logged, ended = [], []
+        noisy = public.Tor("127.0.0.1", h.server.port, logged.append, on_stop=lambda: ended.append(1),
+                           peers=h.server.relayed, folder=tmp / "tor-noisy")
+        try:
+            h.call(noisy.start())
+            deadline = time.time() + 10
+            while not ended and time.time() < deadline:
+                time.sleep(0.1)
+        finally:
+            os.environ.pop("FAKE_TOR_LONG")
+        check("a line over the reader's limit is skipped: the next error is logged and the exit noticed",
+              ended and any("something went wrong" in line for line in logged) and not noisy.on, logged)
         tor.keep = False
         fresh = h.call(tor.start())
         check("without keep: a new address each time", fresh != address
@@ -399,6 +418,12 @@ def lan_checks(tmp):
         check("LAN off: the LAN address is closed, this machine still gets in, and its waits are cut",
               not srv.lan and not reaches(address) and reaches("127.0.0.1") and cut, err)
         loopback = srv.listeners["127.0.0.1"]
+
+        async def open_then_close():
+            await asyncio.gather(srv.set_lan(True), srv.set_lan(False))
+        call(open_then_close())
+        check("Turn on then at once Turn off: closed, and nothing listens on the LAN address",
+              not srv.lan and list(srv.listeners) == ["127.0.0.1"] and not reaches(address), list(srv.listeners))
         call(srv.set_lan(True))
         check("LAN on again", srv.lan and reaches(address))
         call(srv.set_lan(False))
@@ -553,6 +578,9 @@ async def tui_access_test(tmp, bin_dir):
             key2 = os.urandom(32)
             app.chat._join(proto.b64(key2), key2, {"name": "second"}, "192.0.2.31", server.LAN)
             app.refresh_tables()
+            app.command("/approve mine")
+            check("/approve mine without a name or code approves nobody (rows shift)",
+                  app.chat.by_name("second") is None)
             app.command("/approve guest")
             check("/approve guest: the selected request, as a guest",
                   app.chat.by_name("second") and app.chat.by_name("second").guest is True)

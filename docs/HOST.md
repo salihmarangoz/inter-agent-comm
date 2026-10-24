@@ -78,7 +78,7 @@ orchestrator closes the chat when the work is done.
   text with the mouse copies it right away (`clip.py` holds the X11
   clipboard when no clipboard tool is installed). Typing goes to the input
   wherever focus is. Commands:
-  `/approve [name|code] [mine|guest]`, `/reject [name|code]`, `/mine NAME`,
+  `/approve [name|code] [mine|guest]` (mine needs the name or code), `/reject [name|code]`, `/mine NAME`,
   `/guest NAME` (`mine` and `guest` can't be agents' names), `/kick NAME`, `/mute NAME`,
   `/unmute NAME`, `/stop [NAME|all]`, `/go [NAME|all]`, `/files`,
   `/cancel ID`, `/share` (or `/public`), `/public off`, `/copy [N]`, `/who`, `/help`,

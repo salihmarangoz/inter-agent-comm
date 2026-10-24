@@ -141,7 +141,8 @@ class Relay:
                 self.log(f"the chat server isn't reachable ({e or type(e).__name__})")
                 return
             local = tuple(up_writer.get_extra_info("sockname")[:2])
-            entry = self.peers[local] = (proto.TOR, "")   # before any byte goes up
+            # before any byte goes up; a list, so each entry is its own object (see wss.forget_later)
+            entry = self.peers[local] = [proto.TOR, ""]
             try:
                 await _pipe(reader, writer, up_reader, up_writer)
             finally:
@@ -282,7 +283,13 @@ class Tunnel:
     async def _watch(self, process):
         """Drain the process's output and notice when it exits on its own."""
         stream = getattr(process, self.output)
-        while line := await stream.readline():
+        while True:
+            try:
+                line = await stream.readline()
+            except ValueError:   # a line over the stream's limit: skipped, the rest still read
+                continue
+            if not line:
+                break
             if self._is_error(line):
                 self.log(f"{self.program}: {line.decode(errors='replace').strip()[-200:]}")
         code = await process.wait()

@@ -16,8 +16,9 @@ version may break old clients or servers).
 - The Share window ran `ip` twice a second while LAN was open, holding up
   the chat; and it opened with LAN's Turn on focused, so one Enter opened
   LAN. It opens with the X focused now.
-- `/approve mine` and `/approve guest` work on the selected request, as
-  `/help` says.
+- `/approve guest` alone approves the selected request, as `/help` says;
+  `/approve mine` needs the request's name or code, since the selected
+  row shifts as others come and go.
 - `--listen ADDRESS` opens LAN at a new start again, as it did before
   0.2.0.
 - The lead (`--orchestrator`) approved as a guest can't lead: the request
@@ -28,6 +29,10 @@ version may break old clients or servers).
   relayed connection the server never took no longer leaves an entry
   that could tag a later local connection.
 - A non-ASCII `.onion` address gave a traceback instead of an error.
+- Opening LAN and at once closing it could leave the LAN address listening
+  while the TUI showed it closed; LAN changes happen one at a time now.
+- A very long line from tor or cloudflared stopped the server watching it,
+  so its exit went unnoticed.
 
 ## [0.2.0] - 2026-10-24
 

@@ -451,6 +451,7 @@ class ChatServer:
         self.lan = lan and not is_loopback(listen)
         self.listeners = {}   # host -> asyncio server: --listen while LAN is on, and 127.0.0.1
         self.lan_tasks = set()   # connections from other machines, cut when LAN turns off
+        self.lan_lock = asyncio.Lock()   # one set_lan at a time: a close mustn't slip in before an open binds
         self.lead = lead      # --orchestrator: holds the role whenever it's a member
         self.resume_chat = resume  # False: a restart starts a new chat
         self.files = FileStore(files or proto.files_dir())
@@ -673,21 +674,24 @@ class ChatServer:
 
     async def set_lan(self, on):
         """Open or close the LAN way in. Closing it cuts the agents on
-        other machines that are connected now (a wait, a transfer)."""
-        if on == self.lan or (on and not self.lan_possible):
+        other machines that are connected now (a wait, a transfer). Asking
+        for what it already is binds what's missing (a close whose 127.0.0.1
+        bind failed, tried again)."""
+        if on and not self.lan_possible:
             return
-        self.lan = on
-        try:
-            await self._listen()
-        except OSError:
-            if on:   # back to what it was; closing has nothing to go back to
-                self.lan = False
+        async with self.lan_lock:
+            self.lan = on
+            try:
                 await self._listen()
-            raise
-        finally:
-            if not self.lan:
-                for task in list(self.lan_tasks):
-                    task.cancel()
+            except OSError:
+                if on:   # back to what it was; closing has nothing to go back to
+                    self.lan = False
+                    await self._listen()
+                raise
+            finally:
+                if not self.lan:
+                    for task in list(self.lan_tasks):
+                        task.cancel()
 
     async def _handle(self, reader, writer):
         task = asyncio.current_task()
@@ -2134,7 +2138,8 @@ Type to write as host. @name wakes only that agent, @all wakes everyone, and
 a message without any @name wakes only the orchestrator (everyone if there's
 none). Tab completes an @name. Commands:
   /approve [name|code] [mine|guest]   /reject [name|code]   (default: the selected request;
-                         mine: your own agent, guest: someone else's; default guest unless LOCAL)
+                         mine: your own agent, needs the name or code; guest: someone else's;
+                         default guest unless LOCAL)
   /mine NAME   /guest NAME   (change a member's trust)
   /kick [name]   /mute [name]   /unmute [name]  (default: the selected member)
   /stop [name|all]   /go [name|all]   (default: all; commands fail until /go)
@@ -2953,9 +2958,10 @@ class ServerApp(App):
         if name in ("approve", "reject"):
             # mine and guest are reserved, never an agent's name: alone, they're for the selected request
             who, trust = ("", arg) if arg in ("mine", "guest") else arg.partition(" ")[::2]
-            if trust not in ("", "mine", "guest") or (trust and name == "reject"):
-                self.notify(f"Usage: /{name} [name|code]" + (" [mine|guest]" if name == "approve" else ""),
-                            severity="warning")
+            # Mine names the request: the selected row shifts as others come and go
+            if trust not in ("", "mine", "guest") or (trust and name == "reject") or (trust == "mine" and not who):
+                self.notify(f"Usage: /{name} [name|code]" + (" [mine|guest] (mine needs the name or code)"
+                                                             if name == "approve" else ""), severity="warning")
                 return
             key = self.find_request(who) if who else self.selected("requests")
             if key is None:
