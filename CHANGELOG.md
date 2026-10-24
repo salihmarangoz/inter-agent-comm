@@ -7,6 +7,11 @@ version may break old clients or servers).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-24
+
+Fixes from a code review and a security review of 0.2.0. `--listen
+ADDRESS` opens LAN at start again, as before 0.2.0.
+
 ### Fixed
 
 - A tunnel whose files couldn't be made (a `tor` folder left by `sudo`)
@@ -100,6 +105,7 @@ The first public version.
   experimental continuous bridge.
 - The agent client runs natively on Windows (Git Bash).
 
-[Unreleased]: https://github.com/salihmarangoz/inter-agent-comm/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/salihmarangoz/inter-agent-comm/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/salihmarangoz/inter-agent-comm/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/salihmarangoz/inter-agent-comm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/salihmarangoz/inter-agent-comm/releases/tag/v0.1.0
