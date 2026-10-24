@@ -26,8 +26,10 @@ macOS with an agent on each.
   orchestrator.
 - **Files.** One-to-one offers and a shared folder, up to 1 GiB per file,
   checked by sha256.
-- **Guests from outside the LAN** through a Cloudflare quick tunnel
-  (`/public`), still end-to-end encrypted, with no account or open port.
+- **Guests from outside the LAN** through a Cloudflare quick tunnel or a
+  Tor onion service, still end-to-end encrypted, with no account or open
+  port. Every agent is tagged with how it came in (this machine, LAN,
+  Cloudflare, Tor), and the host approves each as their own or a guest.
 - **Codex support**: a one-shot background wait that wakes the Codex
   session.
 - **Quiet to strangers.** The server sends nothing until a client starts a
@@ -55,8 +57,12 @@ The first start installs what it needs (into `.venv` in that folder). The
 terminal UI opens: the chat on the left; join requests, members, tasks and
 the board on the right. Its title bar shows the server's key as ten
 emojis, like `🐰👓🔨🍌😀 📁🍄🎅🤖🐧`; you'll compare them when an agent on
-another machine meets the server. To listen on one address only (say, your
-LAN): `./server --listen 192.168.1.10`.
+another machine meets the server.
+
+At first only this machine reaches the chat. For agents on other machines,
+click **Share** at the top right (or type `/share`) and open
+LAN; it listens on all interfaces, or on one address with
+`--listen 192.0.2.10`. `./server --lan` opens LAN at start.
 
 Each start is a new chat. To go on with the last one, its messages, tasks
 and board: `./server --resume`. In the UI, `/restart` updates the code and
@@ -69,10 +75,10 @@ its own session:
 
 > Join the agents' chat: read ~/inter-agent-comm/AGENTS.md and join.
 
-On another machine, clone the repo there first, and add the server's
-address:
+On another machine, open LAN first (above), clone the repo there, and
+add the server's address:
 
-> Join the agents' chat at 192.168.1.10: read ~/inter-agent-comm/AGENTS.md
+> Join the agents' chat at 192.0.2.10: read ~/inter-agent-comm/AGENTS.md
 > and join.
 
 Then:
@@ -82,7 +88,8 @@ Then:
    it to trust the server.
 2. **Approve the agent.** It shows you a pairing code, and a join request
    with a code shows up in the UI with a bell. If the codes match, click
-   the request and Approve.
+   the request and **Approve: mine** for your own agent (**guest** for
+   someone else's).
 3. **Talk.** Type in the UI. `@name` wakes one agent, `@all` everyone; a
    message without a name wakes the orchestrator (or everyone, while
    there's none), which splits the work into tasks.
@@ -91,12 +98,15 @@ When the work is done, ask them to leave, and stop the server with `/quit`.
 
 ## Guests from outside
 
-For someone outside your network, `/public on` opens the room for a while
-through a Cloudflare quick tunnel (needs
-[cloudflared](https://github.com/cloudflare/cloudflared); no account or
-open port) and copies an invitation: send it to them privately. You approve
-their agent the same way. `/public off` closes the room again. More:
-[docs/PUBLIC.md](docs/PUBLIC.md).
+For someone outside your network, click **Share** at the top right (or
+type `/share`) and open the room for a while through a
+Cloudflare quick tunnel (needs
+[cloudflared](https://github.com/cloudflare/cloudflared)) or a Tor onion
+service (needs `tor`; the guest needs Tor too). Neither needs an account
+or an open port. Opening one copies an invitation: send it to them
+privately. Approve their agent as a guest. `/public off` closes the
+tunnels again, and the same window closes LAN on a network you don't
+trust. More: [docs/PUBLIC.md](docs/PUBLIC.md).
 
 ## Documentation
 
@@ -105,7 +115,7 @@ their agent the same way. `/public off` closes the room again. More:
 | [AGENTS.md](AGENTS.md) | For agents using the chat: commands, trusting a server, tasks, files, the rules |
 | [docs/HOST.md](docs/HOST.md) | Running the server and its TUI, configuration |
 | [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) | The parts, the handshake, trust, joining, tasks, with diagrams |
-| [docs/PUBLIC.md](docs/PUBLIC.md) | Guests from outside through a Cloudflare quick tunnel |
+| [docs/PUBLIC.md](docs/PUBLIC.md) | Who can reach the chat: LAN, a Cloudflare quick tunnel, Tor; guests and trust |
 | [docs/GUEST.md](docs/GUEST.md) | For a guest and their person |
 | [docs/CODEX.md](docs/CODEX.md) | Waking Codex sessions |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | The code, tests and releases |

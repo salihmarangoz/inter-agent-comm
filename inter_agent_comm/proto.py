@@ -32,7 +32,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from noise.connection import Keypair, NoiseConnection
 
-from . import wss
+from . import onion, wss
 
 PROTOCOL = "2"   # the wire protocol; the release version is __version__ in __init__.py
 NOISE_NAME = b"Noise_XX_25519_ChaChaPoly_BLAKE2s"
@@ -52,7 +52,13 @@ NAME_MAX = 48
 NAME_RE = re.compile(rf"[a-z0-9][a-z0-9._-]{{1,{NAME_MAX - 1}}}")
 CONSOLE = "host"    # the name the human at the server's console speaks as; nobody else can
 CONSOLE_LABEL = f"{CONSOLE} (the human at the server, verified by the server)"
-RESERVED = {CONSOLE, "server", "system", "all", "everyone", "here"}
+RESERVED = {CONSOLE, "server", "system", "all", "everyone", "here", "mine", "guest"}   # mine, guest: /approve NAME mine
+# How a connection reached the server, the tag the TUI and who show: this
+# machine, the LAN (or a VPN, any network the server listens on), or a
+# tunnel from the internet (Cloudflare, Tor). Trust comes from the host's
+# approval, not from the way in.
+LOCAL, LAN, CF, TOR = "LOCAL", "LAN", "CF", "TOR"
+TUNNELS = (CF, TOR)
 
 PACKAGE = Path(__file__).resolve().parent
 ROOT = PACKAGE.parent   # the repo: the launchers, docs and pyproject.toml
@@ -358,9 +364,12 @@ def open_server(host, port, private, timeout=5):
     finish() sends our key once we trust the server's. Raises OSError when
     the address can't be reached or the connection breaks, and
     ProtocolError when the other side isn't an inter-agent-comm server. A ws:// or wss:// URL as host goes
-    through the WebSocket gateway (wss.py); port is then unused."""
+    through the WebSocket gateway (wss.py); port is then unused. A NAME.onion host goes through
+    this machine's Tor (onion.py), with a longer timeout."""
     if wss.is_url(host):
         sock = wss.open_stream(host, timeout)
+    elif onion.is_onion(host):
+        sock = onion.connect(host, port, timeout)
     else:
         sock = socket.create_connection((host, port), timeout=timeout)
     try:

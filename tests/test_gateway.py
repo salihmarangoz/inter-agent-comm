@@ -66,14 +66,14 @@ def public_checks(tmp, h):
     (bin_dir / "cloudflared").chmod(0o755)
     saved_path = os.environ["PATH"]
     lines, stopped = [], []
-    pub = public.Public("testhost", h.server.public, "127.0.0.1", h.server.port, lines.append,
-                        on_stop=lambda: stopped.append(1))
+    pub = public.Cloudflare("127.0.0.1", h.server.port, lines.append, on_stop=lambda: stopped.append(1))
     os.environ["PATH"] = f"{bin_dir}:{saved_path}"
     try:
         url = h.call(pub.start())
     finally:
         os.environ["PATH"] = saved_path
-    check("/public on: the tunnel's address", url == "https://fake-tunnel-name.trycloudflare.com", url)
+    check("/public on: the tunnel's address", url == "wss://fake-tunnel-name.trycloudflare.com/"
+          and pub.url == "https://fake-tunnel-name.trycloudflare.com", url)
     invite = public.invitation(url, h.server.public)
     fp = proto.fingerprint(h.server.public)
     gets = [line.strip() for line in invite.splitlines() if "git clone" in line or "curl" in line]
@@ -82,9 +82,9 @@ def public_checks(tmp, h):
     key = proto.b64(h.server.public)
     check("joining is its own step, through the tunnel's wss address, trusting the server's whole key",
           f"inter-agent-comm/chat --address wss://fake-tunnel-name.trycloudflare.com/ join --trust {key}" in invite
-          and not any("chat " in line for line in gets), invite)
+          and not any("chat " in line for line in gets) and "Tor" not in invite, invite)
     check("the invitation shows the key's emojis", proto.emojis(h.server.public) in invite, invite)
-    port = pub.gateway.port
+    port = pub.relay.port
 
     def http(path):
         try:
@@ -151,7 +151,7 @@ def public_checks(tmp, h):
     deadline = time.time() + 5
     while not stopped and time.time() < deadline:
         time.sleep(0.1)
-    check("cloudflared dying ends /public and tells the TUI", stopped and not pub.on and pub.gateway is None,
+    check("cloudflared dying ends /public and tells the TUI", stopped and not pub.on and pub.relay is None,
           lines[-2:])
     check("the gateway port is closed then", status_of(f"ws://127.0.0.1:{port}/") is None)
 
@@ -167,7 +167,7 @@ def public_checks(tmp, h):
         alive = True
     except ProcessLookupError:
         alive = False
-    check("/public off stops cloudflared and the gateway", not alive and pub.gateway is None and not stopped[1:])
+    check("/public off stops cloudflared and the gateway", not alive and pub.relay is None and not stopped[1:])
 
     os.environ["PATH"] = str(tmp / "empty-bin")
     try:
@@ -178,7 +178,7 @@ def public_checks(tmp, h):
     finally:
         os.environ["PATH"] = saved_path
     check("without cloudflared: a clear error, nothing left running",
-          "isn't installed" in err and pub.gateway is None, err)
+          "isn't installed" in err and pub.relay is None, err)
 
 
 def join_limit_checks(h):
@@ -186,9 +186,10 @@ def join_limit_checks(h):
     from inter_agent_comm import server
     srv = h.server
 
-    def join(name, ip):
+    def join(name, ip, via=None):
         public = os.urandom(32)
-        return h.call(srv._join, server.proto.b64(public), public, {"name": name}, ip)
+        via = via or (server.LOCAL if ip == "127.0.0.1" else server.LAN)
+        return h.call(srv._join, server.proto.b64(public), public, {"name": name}, ip, via)
 
     print("join limits")
     srv_events = len(h.events)
@@ -212,14 +213,22 @@ def join_limit_checks(h):
     check("the TUI hears about refusals once, not per attempt",
           h.events[srv_events:].count("error") == 1, h.events[srv_events:])
     h.call(lambda: srv.requests.clear())
-    outside = [join(f"out-{i}", f"203.0.113.{i} (public)") for i in range(server.MAX_PENDING_PUBLIC + 1)]
-    check("requests through /public have their own cap",
+    outside = [join(f"out-{i}", f"203.0.113.{i}", server.CF) for i in range(server.MAX_PENDING_PUBLIC + 1)]
+    check("requests through the tunnels have their own cap",
           all(r.get("state") == "pending" for r in outside[:-1]) and outside[-1].get("code") == "busy",
           outside[-1])
     check("so local agents still find room", join("local-after", "127.0.0.1").get("state") == "pending")
     h.call(lambda: srv.requests.clear())
-    same = [join(f"same-{i}", "198.51.100.77 (public)") for i in range(server.MAX_PENDING_PER_IP + 1)]
-    check("one visitor through /public is limited like a LAN address", same[-1].get("code") == "busy", same[-1])
+    same = [join(f"same-{i}", "198.51.100.77", server.CF) for i in range(server.MAX_PENDING_PER_IP + 1)]
+    check("one visitor through Cloudflare is limited like a LAN address", same[-1].get("code") == "busy", same[-1])
+    check("and apart from the same address on the LAN", join("same-lan", "198.51.100.77").get("state") == "pending")
+    h.call(lambda: srv.requests.clear())
+    tor = [join(f"tor-{i}", "", server.TOR) for i in range(server.MAX_PENDING_PER_IP + 1)]
+    check("Tor shows no address: all its requests count as one", tor[-1].get("code") == "busy"
+          and "from TOR" in tor[-1].get("message", ""), tor[-1])
+    mixed = [join("tor-x", "", server.TOR), join("cf-x", "203.0.113.9", server.CF)]
+    check("the tunnels share their cap, not their per-address count",
+          mixed[0].get("code") == "busy" and mixed[1].get("state") == "pending", mixed)
     h.call(lambda: srv.requests.clear())
     v6 = [join(f"six-{i}", f"2001:db8:1:2::{i + 1}") for i in range(server.MAX_PENDING_PER_IP + 1)]
     check("IPv6 addresses from one /64 count as one address", v6[-1].get("code") == "busy", v6[-1])
@@ -241,7 +250,7 @@ def join_limit_checks(h):
 
 
 async def tui_public_test(tmp, bin_dir):
-    """/public on and off in the TUI, with the stand-in cloudflared."""
+    """The Access window in the TUI: Cloudflare on and off, with the stand-in cloudflared."""
     import argparse
 
     from inter_agent_comm import server
@@ -256,50 +265,68 @@ async def tui_public_test(tmp, bin_dir):
     args = argparse.Namespace(name="pubtui", port=0, listen="127.0.0.1", publish=False, orchestrator="", no_transcript=True,
                               transcripts=None)
     app = server.ServerApp(args)
+    pid = None
     try:
         async with app.run_test(size=(150, 40)) as pilot:
             written = []
             write = app.write_line
             app.write_line = lambda text: (written.append(str(text)), write(text))
+            label = str(app.query_one("#access-label").render())
+            check("the side panel shows the ways in: --listen 127.0.0.1 is this machine only",
+                  "Open to: LOCAL" in label and "LAN" not in label, label)
             app.query_one("#input").value = "/public on"
             await pilot.press("enter")
+            await pilot.pause()
+            check("/public on opens the Share window", isinstance(app.screen, server.AccessDialog), app.screen)
+            check("LAN can't be opened when the server listens on 127.0.0.1",
+                  app.screen.query_one("#toggle-LAN").disabled)
+            await pilot.click("#toggle-CF")
             for _ in range(50):
-                if app.public and app.public.on:
+                if app.tunnels["CF"] and app.tunnels["CF"].on:
                     break
                 await asyncio.sleep(0.1)
             await pilot.pause()
-            check("/public on opens the tunnel and says so",
-                  app.public and app.public.on and "PUBLIC" in app.sub_title and
-                  any("Public at https://fake-tunnel-name.trycloudflare.com" in w for w in written), written[-3:])
+            check("Turn on opens the tunnel and says so",
+                  app.tunnels["CF"] and app.tunnels["CF"].on and "PUBLIC" in app.sub_title and
+                  any("CF is open at https://fake-tunnel-name.trycloudflare.com" in w for w in written), written[-3:])
             check("and copies the invitation", copied and copied[-1].startswith("You're invited") and
                   "--address wss://fake-tunnel-name.trycloudflare.com/ join --trust" in copied[-1], copied)
             check("its gateway reports tunnelled connections to the server",
-                  app.public.gateway.peers is app.chat.relayed)
-            port = app.public.gateway.port
+                  app.tunnels["CF"].relay.peers is app.chat.relayed)
+            check("the window and the side panel show it open",
+                  "open at https://fake-tunnel-name" in str(app.screen.query_one("#state-CF").render())
+                  and "CF" in str(app.query_one("#access-label").render()))
+            check("the ways in are saved for --resume",
+                  json.loads((tmp / "pub-tui-home" / "access.json").read_text())["on"] == ["CF"])
+            await pilot.press("escape")
+            await pilot.pause()
+            port = app.tunnels["CF"].relay.port
             app.query_one("#input").value = "/public off"
             await pilot.press("enter")
             for _ in range(50):
-                if app.public is None and "PUBLIC" not in app.sub_title:
+                if app.tunnels["CF"] is None and "PUBLIC" not in app.sub_title:
                     break
                 await asyncio.sleep(0.1)
-            check("/public off closes it", app.public is None and "PUBLIC" not in app.sub_title and
+            check("/public off closes it", app.tunnels["CF"] is None and "PUBLIC" not in app.sub_title and
                   await asyncio.to_thread(status_of, f"ws://127.0.0.1:{port}/") is None)
-            app.query_one("#input").value = "/public on"
+            app.query_one("#input").value = "/access"
             await pilot.press("enter")
+            await pilot.pause()
+            await pilot.click("#toggle-CF")
             for _ in range(50):
-                if app.public and app.public.on:
+                if app.tunnels["CF"] and app.tunnels["CF"].on:
                     break
                 await asyncio.sleep(0.1)
-            pid = app.public.process.pid
+            pid = app.tunnels["CF"].process.pid
     finally:
         os.environ["PATH"] = saved_path
         server.system_copy = saved_copy
     try:
         os.kill(pid, 0)
         alive = True
-    except ProcessLookupError:
+    except (ProcessLookupError, TypeError):
         alive = False
-    check("quitting the server stops cloudflared", not alive)
+    check("quitting the server stops cloudflared", pid and not alive)
 
 
 def busy_wait_check(h):
@@ -371,18 +398,24 @@ def run_checks():
           r.returncode == 0 and code and req and req.code == code.group(1), r.stdout + r.stderr)
     p = chat_bg(a, servers, "-n", "far-a", "wait")
     time.sleep(1)
-    check("a request through the gateway is marked public, with the visitor's address",
-          req and req.ip == "127.0.0.1 (public)", req and req.ip)
+    check("a request through the gateway is tagged CF, with the visitor's address",
+          req and req.via == "CF" and req.ip == "127.0.0.1", req and (req.via, req.ip))
     h.call(h.server.approve, req.key)
     out, err = p.communicate(timeout=10)
     check("wait returns on approval through the gateway", "The host approved you" in out, out + err)
     row = next((r for r in h.call(h.server.who) if r["name"] == "far-a"), {})
-    check("who marks a public member", row.get("host", "").endswith(" (public)"), row)
+    check("who tags it CF, and a guest: approved without a choice, a tunnel's agent is one",
+          row.get("via") == "CF" and row.get("guest") is True, row)
+    check("and keeps (guest) after its machine, for clients that show only that",
+          row.get("host", "").endswith(" (guest)"), row)
+    r = chat(a, servers, "-n", "far-a", "who")
+    check("the client's who shows the tag", re.search(r"far-a .* CF guest ", r.stdout), r.stdout)
     joined = [m["text"] for m in h.call(lambda: list(h.server.history)) if "far-a joined" in m["text"]]
-    check("the join event says it came through /public", joined and "through /public" in joined[-1], joined)
+    check("the join event says how it came, and that it's a guest",
+          joined and "joined by CF as a guest, machine" in joined[-1], joined)
     r = chat(tmp / "lan-a", h.servers, "-n", "lan-a", "join")
     lan = h.request_of("lan-a")
-    check("a direct connection isn't marked", lan and lan.ip == "127.0.0.1", lan and lan.ip)
+    check("a direct connection from this machine is tagged LOCAL", lan and lan.via == "LOCAL", lan and lan.via)
     h.call(lambda: h.server.requests.pop(lan.key, None))
     chat(b, servers, "-n", "far-b", "join")
     h.call(h.server.approve, h.request_of("far-b").key)
@@ -429,6 +462,11 @@ def run_checks():
           and "No such file" in r2.stderr and r3.returncode == 1 and "not guests" in r3.stderr
           and "internal.txt" not in r4.stdout and "far-b" in r4.stdout,
           r.stdout + r2.stderr + r3.stderr + r4.stdout)
+    h.call(h.server.set_guest, "far-a", False)
+    r = chat(a, servers, "-n", "far-a", "files")
+    check("trust is the host's choice, not the way in: made the host's own, a CF member sees the folder",
+          sid in r.stdout, r.stdout + r.stderr)
+    h.call(h.server.set_guest, "far-a", True)
 
     check("only / is served", status_of(f"ws://127.0.0.1:{port}/other") == 404)
     held = [raw_ws(url, "203.0.113.5") for _ in range(wss.MAX_OPEN_PER_IP)]

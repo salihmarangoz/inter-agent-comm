@@ -11,6 +11,11 @@
 - Keep it generic: no personal names, machine names, addresses, accounts
   or company context in code, docs, tests or commit messages. Examples use
   placeholders (`laptop.webshop`, `192.0.2.10`).
+- Work on a branch and push it, not `main`: `main` changes only at a
+  release, which merges the branch and then deletes it
+  (docs/DEVELOPMENT.md, "Versions and releases").
+- A visible change to the TUI: run `docs/make_screenshot.py` again, so the
+  README's picture shows the TUI as it is.
 - Run the tests after every change, then push:
 
   ```

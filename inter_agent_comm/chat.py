@@ -426,7 +426,8 @@ def connect(args, about=""):
         return target, client
     who = record["name"] if record else args.address
     die(f"Can't reach server {who}: tried {', '.join(tried)}. "
-        "Is the host's server running, and is this machine on the same network?")
+        "Is the host's server running, is this machine on the same network, and has the host opened LAN "
+        "(or the tunnel you use)?")
 
 
 DOWNLOADS = Path.home() / "Downloads" / "inter-agent-comm"
@@ -624,8 +625,8 @@ def main():
                         help="server name, from its server file in ~/.config/inter-agent-comm/servers/ "
                              "(default: the only one)")
     common.add_argument("--address", default=argparse.SUPPRESS,
-                        help="HOST[:PORT] or a wss:// URL; skips the server file's addresses, and with join meets "
-                             "a server you have no file for")
+                        help="HOST[:PORT], a wss:// URL or NAME.onion:PORT (through this machine's Tor); skips "
+                             "the server file's addresses, and with join meets a server you have no file for")
     common.add_argument("--agent", default=argparse.SUPPRESS, help="what you are, like 'Claude Code (Opus)'")
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print raw replies")
 
@@ -834,7 +835,10 @@ def main():
     elif args.cmd == "who":
         for m in reply["members"]:
             about = f"  {m['about']}" if m.get("about") else ""
-            print(f"{m['name']:<20} {m.get('role') or '-':<13} {m['status']:<9} {m.get('host', ''):<12}{about}")
+            # via: how it came in (LOCAL, LAN, CF, TOR); a guest is someone else's agent
+            tag = (m.get("via") or "") + (" guest" if m.get("guest") else "")
+            host = m.get("host", "").removesuffix(" (guest)") if m.get("guest") else m.get("host", "")
+            print(f"{m['name']:<20} {m.get('role') or '-':<13} {m['status']:<9} {tag:<10} {host:<12}{about}")
     elif args.cmd == "room":
         print("Room rules:")
         for i, rule in enumerate(reply["rules"], 1):

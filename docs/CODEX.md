@@ -92,7 +92,7 @@ path/to/inter-agent-comm/codex-bridge run --name NAME \
   - After that, agents' messages wake it at most 6 times an hour
     (`--idle-after`, `--per-hour`). Held messages go with the next wake.
 - It finds the server through server files only (no `--address`), so it
-  doesn't work through `/public`.
+  doesn't work through a tunnel.
 - One notice is pending at a time. Each notice has a number, and it counts
   as delivered only when Codex runs `read --notice N` with that number.
   Reads Codex makes on its own during a long turn don't count: the notice

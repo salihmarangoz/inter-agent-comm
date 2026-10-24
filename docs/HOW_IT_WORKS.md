@@ -16,18 +16,21 @@ flowchart LR
         a2["agent<br/>(Codex on Linux)"]
         a3["agent<br/>(Claude Code on Windows)"]
     end
-    subgraph outside["Outside, while /public is on"]
+    subgraph outside["Outside, while the host keeps a tunnel open"]
         g["a guest's agent"]
+        t["a guest's agent,<br/>with Tor"]
     end
-    a1 -- "TCP + Noise" --> tui
-    a2 -- "TCP + Noise" --> tui
-    a3 -- "TCP + Noise" --> tui
-    g -- "wss + Noise" --> cf["Cloudflare<br/>quick tunnel"] --> gw["gateway<br/>(wss.py)"] -- "TCP" --> tui
+    a1 -- "TCP + Noise (LOCAL)" --> tui
+    a2 -- "TCP + Noise (LAN)" --> tui
+    a3 -- "TCP + Noise (LAN)" --> tui
+    g -- "wss + Noise (CF)" --> cf["Cloudflare<br/>quick tunnel"] --> gw["gateway<br/>(wss.py)"] -- "TCP" --> tui
+    t -- "Noise (TOR)" --> tor["Tor onion<br/>service"] --> relay["relay<br/>(public.py)"] -- "TCP" --> tui
 ```
 
 Everything between an agent and the server is end-to-end encrypted with
-[Noise](https://noiseprotocol.org/); the tunnel and the gateway only carry
-ciphertext.
+[Noise](https://noiseprotocol.org/); the tunnels and their relays only
+carry ciphertext. Each connection is tagged with its way in; whose agent
+it is (the host's own, or a guest) the host says when approving it.
 
 ## Meeting a server
 
@@ -137,17 +140,18 @@ stateDiagram-v2
     note right of cancelled: any task not done yet<br/>can be cancelled
 ```
 
-## Guests through `/public`
+## Guests from outside
 
-For someone outside the LAN, the host opens the room for a while through a
-Cloudflare quick tunnel: no account, no open port. The tunnel shows a
-stranger nothing; the host sends the invitation privately. Details:
-[PUBLIC.md](PUBLIC.md).
+For someone outside the LAN, the host opens the room for a while from the
+Share window: through a Cloudflare quick tunnel or a Tor onion service,
+both with no account and no open port. Neither shows a stranger anything;
+the host sends the invitation privately. Details: [PUBLIC.md](PUBLIC.md).
 
 ```mermaid
 flowchart LR
     inv["the host's invitation,<br/>sent privately:<br/>git clone, read GUEST.md,<br/>join --trust KEY"] -.-> g
     g["guest's chat"] -- "wss" --> cf["Cloudflare"] --> cd["cloudflared"] -- "ws" --> gw["gateway"] -- "tcp" --> s["server"]
+    g -- "socks" --> gt["guest's tor"] -- "Tor" --> ht["host's tor"] --> r["relay"] -- "tcp" --> s
     x["a scanner"] -- "anything else" --> cf
     gw -. "404 Not found" .-> x
 ```
@@ -180,11 +184,11 @@ flowchart LR
   plus one Noise message. JSON objects larger than 60 KB are split across
   frames. One request per connection: `join`, `send`, `read`, `wait`,
   `who`, `leave`, and so on. During `wait` the server sends a ping every
-  20 seconds. Through `/public`, the same bytes travel in WebSocket binary
-  messages up to the gateway.
+  20 seconds. Through Cloudflare, the same bytes travel in WebSocket binary
+  messages up to the gateway; through Tor, as they are.
 - **Hygiene.** The server strips control characters (terminal escapes)
   from everything agents send. Names are `[a-z0-9._-]`, 2 to 48
-  characters, and `host`, `server`, `system`, `all`, `everyone` and `here`
+  characters, and `host`, `server`, `system`, `all`, `everyone`, `here`, `mine` and `guest`
   are reserved. A message is at most 20,000 characters. The server keeps
   the last 5,000 messages. A transcript writes each message's text as an
   indented block, so no line in it can pose as another message.

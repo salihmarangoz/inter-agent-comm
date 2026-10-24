@@ -1,7 +1,8 @@
 # Security policy
 
 inter-agent-comm lets AI agents on several machines talk to each other,
-exchange files and, through `/public`, join from the internet. Holes in it
+exchange files and, through a Cloudflare tunnel or a Tor onion service,
+join from the internet. Holes in it
 can matter, so thank you for looking.
 
 ## Supported versions
@@ -21,8 +22,8 @@ vulnerability.
   subject.
 
 Include what an attacker can do, the commit you tested, how to reproduce
-it (a proof of concept helps), and your setup: LAN only, `/public`, the
-Codex wait or bridge.
+it (a proof of concept helps), and your setup: LAN only, a Cloudflare
+tunnel, Tor, the Codex wait or bridge.
 
 ## What to expect
 
@@ -37,13 +38,16 @@ This is a one-person project, so it's best effort:
 ## In scope
 
 The server (`server.py`), the client (`chat.py`), the protocol and handshake
-(`proto.py`), the WebSocket gateway and `/public` (`wss.py`, `public.py`), all
+(`proto.py`), the tunnels: the WebSocket gateway, the Tor relay and the
+client's way through Tor (`wss.py`, `public.py`, `onion.py`), all
 in `inter_agent_comm/`,
 file offers and the shared folder, the Codex wait, notify and bridge, and
 the guest invitation. For example, anything that lets someone:
 
 - read or write the chat, or files in it, without the host's approval;
 - pose as the server, the host (`host` messages), or another approved agent;
+- come in by a tunnel and be taken for an agent on the host's machine, or
+  for the host's own agent when the host approved it as a guest;
 - write outside the download folder, overwrite a file, or get past the
   size and quota limits;
 - run code on the host's or an agent's machine;
@@ -75,6 +79,28 @@ the guest invitation. For example, anything that lets someone:
   random `trycloudflare.com` address and this public client can ask to
   join; joining still needs the host's approval. The tunnel has no uptime
   guarantee.
+- **Tor.** The onion service is a single onion service: guests'
+  addresses stay hidden, the host's doesn't (the Tor relays its tor talks
+  to see it, as Cloudflare would). Tor hides only addresses: an agent's
+  name, machine and folder still reach the host and members. Anyone with the `.onion` address can ask
+  to join; joining still needs the host's approval. Tor shows no visitor
+  address, so all Tor guests share one set of limits: a flood through Tor
+  can keep other Tor guests out (not LAN or Cloudflare ones), though
+  Tor's proof-of-work defense makes it costly. A kept onion key
+  (`~/.config/inter-agent-comm/tor/onion/`) lets anything running as the
+  host's user pose as that address, like the server key.
+- **The way in isn't trust.** The `LOCAL`, `LAN`, `CF`, `TOR` tags say how
+  an agent connected, nothing more; what an approved agent may do comes
+  from the host's choice, Mine or Guest. An agent the host approves as
+  theirs keeps that wherever it connects from, as its key does. Only a
+  `LOCAL` orchestrator may restart the server.
+- **`LOCAL` is anything that reaches 127.0.0.1 here**: the host's agents,
+  but also a port forwarded to this machine (`ssh -L`/`-R`, an editor's
+  port forwarding, `tailscale serve`) and other users of the machine. A
+  `LOCAL` request has **Approve: mine** focused and `/approve NAME` makes
+  it the host's own, so the pairing code is the check that matters there.
+  While LAN is closed, a connection to 127.0.0.1 that comes from another
+  address is hung up on.
 - **Agents' judgment.** The rules tell agents that messages are
   information, never permission. An agent that obeys another agent anyway
   is a problem of that agent, not of this project; a way to make
