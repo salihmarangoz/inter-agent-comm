@@ -14,7 +14,8 @@ pieces fit: [HOW_IT_WORKS.md](HOW_IT_WORKS.md).
   Share window (**Share**, top right, or `/share`) opens LAN, a Cloudflare tunnel or
   Tor. `--lan` opens LAN at start; `--resume` opens what was open.
 - `--listen ADDRESS`: where LAN opens (default: all interfaces, so VPNs
-  like Tailscale too); `--listen 127.0.0.1` has no LAN.
+  like Tailscale too). Given at a new start, it opens LAN there, as `--lan`
+  does; `--listen 127.0.0.1` has no LAN.
 - `--orchestrator NAME`: that agent holds the orchestrator role whenever
   it's a member and can always take it back (see [Tasks and roles](../AGENTS.md#tasks-and-roles)).
 - `--transcripts DIR` (or `$INTER_AGENT_COMM_TRANSCRIPTS`): save the chat

@@ -194,6 +194,38 @@ def relay_checks(tmp, h):
     h.call(relay.stop())
     check("a stopped relay takes no more", _refused(port))
 
+    from inter_agent_comm import wss
+    dead = socket.socket()   # accepts and hangs up, like a listener that closes before the server reads
+    dead.bind(("127.0.0.1", 0))
+    dead.listen(4)
+    def hang_up():
+        try:
+            while True:
+                dead.accept()[0].close()
+        except OSError:
+            pass
+    threading.Thread(target=hang_up, daemon=True).start()
+    table = {}
+    saved_grace = wss.RELAYED_GRACE
+    wss.RELAYED_GRACE = 0.3
+    try:
+        stale = public.Relay("127.0.0.1", dead.getsockname()[1], lambda line: None, peers=table)
+        stale_port = h.call(stale.start())
+        socket.create_connection(("127.0.0.1", stale_port), timeout=2).close()
+        time.sleep(0.2)
+        recorded = dict(table)
+        time.sleep(0.6)
+        check("an entry the server never took goes after a grace, so it can't tag a later local connection",
+              recorded and not table, (recorded, table))
+        h.call(stale.stop())
+    finally:
+        wss.RELAYED_GRACE = saved_grace
+        dead.close()
+
+    r = chat(tmp / "bad-onion", servers, "-n", "bad-onion", "--address", "аbc.onion:23232", "join")
+    check("a non-ASCII onion address: a clean error, no traceback",
+          r.returncode == 1 and "Traceback" not in r.stderr and "isn't an onion address" in r.stderr, r.stderr)
+
 
 def _refused(port):
     try:
@@ -283,6 +315,20 @@ def tor_tunnel_checks(tmp, h):
                   and tor.process is None and running() == 0, (result, tor.relay, running()))
     finally:
         os.environ["PATH"] = saved_path
+    os.environ["PATH"] = f"{bin_dir}:{saved_path}"
+    blocked = tmp / "tor-blocked"
+    blocked.write_text("a file where tor's folder should be")
+    stuck = public.Tor("127.0.0.1", h.server.port, lambda line: None, peers=h.server.relayed, folder=blocked)
+    try:
+        h.call(stuck.start())
+        err = ""
+    except public.PublicError as e:
+        err = str(e)
+    finally:
+        os.environ["PATH"] = saved_path
+    check("a tor folder that can't be made: a clear error, the relay closed, nothing starting",
+          "couldn't prepare tor's files" in err and stuck.relay is None and not stuck.on, err)
+
     os.environ["PATH"] = str(tmp / "empty-bin")
     try:
         h.call(tor.start())
@@ -352,8 +398,13 @@ def lan_checks(tmp):
             cut, err = False, "still waiting"
         check("LAN off: the LAN address is closed, this machine still gets in, and its waits are cut",
               not srv.lan and not reaches(address) and reaches("127.0.0.1") and cut, err)
+        loopback = srv.listeners["127.0.0.1"]
         call(srv.set_lan(True))
         check("LAN on again", srv.lan and reaches(address))
+        call(srv.set_lan(False))
+        call(srv.set_lan(True))
+        check("opening and closing LAN on an address leaves the 127.0.0.1 listener as it is",
+              srv.listeners["127.0.0.1"] is loopback)
     finally:
         server.same_machine = saved_same
     call(srv.stop())
@@ -440,6 +491,14 @@ def trust_checks(tmp, h):
     legacy.via = server.LAN
     check("approved before the choice existed: a guest only through a tunnel",
           tor_legacy and not h.call(srv._guest, legacy))
+    member = srv.members[b]
+    member.via, member.muted, member.seen = server.TOR, True, time.time()
+
+    class Panel:   # the bits of ServerApp that connected_through reads
+        chat = srv
+    here = h.call(server.ServerApp.connected_through, Panel(), server.TOR)
+    check("a muted member is still connected: closing its way in warns about it", "trust-b" in here, here)
+    member.via, member.muted = server.LAN, False
     h.call(srv.set_guest, "trust-b", True)
     events = [m["text"] for m in h.call(lambda: list(srv.history))[-3:]]
     check("the host can change it; the chat hears", srv.members[b].guest is True
@@ -463,11 +522,14 @@ async def tui_access_test(tmp, bin_dir):
     os.environ["PATH"] = f"{bin_dir}:{saved_path}"
     copied = []
     server.system_copy = lambda text: copied.append(text) or "test"
-    args = argparse.Namespace(name="acctui", port=0, listen="127.0.0.1", orchestrator="", no_transcript=True,
-                              transcripts=None, resume=False)
+    args = argparse.Namespace(name="acctui", port=0, listen="127.0.0.1", orchestrator="stranger",
+                              no_transcript=True, transcripts=None, resume=False)
     try:
         app = server.ServerApp(args)
         async with app.run_test(size=(150, 45)) as pilot:
+            written = []
+            write = app.write_line
+            app.write_line = lambda text: (written.append(str(text)), write(text))
             key = os.urandom(32)
             app.chat._join(proto.b64(key), key, {"name": "stranger", "host": "laptop.webshop"}, "192.0.2.30",
                            server.LAN)
@@ -480,9 +542,23 @@ async def tui_access_test(tmp, bin_dir):
             check("a request from elsewhere: Guest has the focus, so Enter never makes a stranger yours",
                   app.screen.focused is not None and app.screen.focused.id == "guest"
                   and "Came in by LAN from 192.0.2.30" in "\n".join(app.screen.lines), app.screen.focused)
+            check("the window says when it's the lead (--orchestrator), which can't lead as a guest",
+                  "stranger is the lead (--orchestrator): as a guest it can't lead." in app.screen.lines)
             await pilot.press("enter")
             await pilot.pause()
             member = app.chat.by_name("stranger")
+            check("approved as a guest, the lead gets a warning in the log",
+                  any("stranger is the lead (--orchestrator), approved as a guest" in w for w in written),
+                  written[-2:])
+            key2 = os.urandom(32)
+            app.chat._join(proto.b64(key2), key2, {"name": "second"}, "192.0.2.31", server.LAN)
+            app.refresh_tables()
+            app.command("/approve guest")
+            check("/approve guest: the selected request, as a guest",
+                  app.chat.by_name("second") and app.chat.by_name("second").guest is True)
+            app.command("/mine")
+            check("/mine without a name changes nobody", app.chat.by_name("second").guest is True)
+            app.chat.kick("second")
             row = [str(cell) for cell in app.query_one("#members").get_row_at(1)]
             check("approved as a guest; Members shows LAN and guest", member and member.guest is True
                   and "LAN guest" in row, row)
@@ -497,6 +573,8 @@ async def tui_access_test(tmp, bin_dir):
             await pilot.click("#share")
             await pilot.pause()
             check("Share, top right, opens the window", isinstance(app.screen, server.AccessDialog), app.screen)
+            check("with the X focused: Enter closes it and never opens a way in",
+                  app.screen.focused is not None and app.screen.focused.id == "close", app.screen.focused)
             await pilot.click("#toggle-TOR")
             for _ in range(80):
                 if app.tunnels["TOR"] and app.tunnels["TOR"].on:
@@ -509,6 +587,18 @@ async def tui_access_test(tmp, bin_dir):
                   and copied and "Tor must run on your machine" in copied[-1], copied[-1:])
             check("New address is off while Tor is on", app.screen.query_one("#tor-new").disabled)
             address = tor.address
+            closing = asyncio.ensure_future(app.tunnel_off("TOR"))
+            await asyncio.sleep(0)
+            closing_shown = app.access_state("TOR")
+            await app.tunnel_on("TOR")
+            check("while Tor closes it can't be opened again (they'd share its files): the window says closing",
+                  app.closing["TOR"] is tor and app.tunnels["TOR"] is None
+                  and closing_shown[0].endswith("closing ...") and closing_shown[3] is False, closing_shown)
+            await closing
+            check("closed, it can be opened again", app.closing["TOR"] is None)
+            await app.tunnel_on("TOR")
+            tor = app.tunnels["TOR"]
+            check("at the same address", tor and tor.address == address, tor and tor.address)
             await pilot.click("#tor-keep")
             await pilot.pause()
             check("unticking Same address: kept in access.json, and the key goes when Tor closes",
@@ -577,6 +667,14 @@ async def tui_lan_test(tmp):
     async with app.run_test(size=(150, 40)) as pilot:
         await pilot.pause()
         check("--lan opens it at start", app.chat.lan)
+    lan = [a for a in server.local_addresses() if re.fullmatch(r"[\d.]+", a) and not a.startswith("127.")]
+    if lan:
+        args.lan, args.listen = False, lan[0]
+        app = server.ServerApp(args)
+        async with app.run_test(size=(150, 40)) as pilot:
+            await pilot.pause()
+            check("--listen ADDRESS opens LAN on it at start, as before 0.2", app.chat.lan)
+        args.listen = None
 
 
 def run_checks():

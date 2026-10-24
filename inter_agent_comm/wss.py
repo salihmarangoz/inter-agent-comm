@@ -35,6 +35,7 @@ MAX_MESSAGE = 1 << 20     # bytes in one WebSocket message; frames are under 64 
 CHUNK = 65536
 UNREACHABLE = 1011        # close code: the gateway can't reach the chat server
 CF = "CF"                 # the way in the gateway records for the server (proto.CF)
+RELAYED_GRACE = 60        # seconds after a relayed connection ends: the server has looked it up by then
 
 
 def _ws_options():
@@ -107,6 +108,19 @@ def open_stream(url, timeout):
     except (InvalidHandshake, InvalidURI, TimeoutError) as e:
         raise OSError(f"no gateway at {url} ({e})") from None
     return Stream(ws, timeout)
+
+
+def forget_later(peers, local, entry):
+    """A relay's entry in the server's table, once its connection has ended:
+    the server pops the ones it served, but not one it never accepted (a
+    listener closing, say). Left there, it would tag an unrelated local
+    connection from the same port. Popping it now could beat the server's
+    own lookup, which comes after the handshake, so it waits RELAYED_GRACE;
+    and it drops only this entry, not a new one for the same port."""
+    def drop():
+        if peers.get(local) is entry:
+            del peers[local]
+    asyncio.get_running_loop().call_later(RELAYED_GRACE, drop)
 
 
 # --- gateway ---
@@ -219,12 +233,14 @@ class Gateway:
             return
         self.trace(f"{ip}: connected")
         local = tuple(writer.get_extra_info("sockname")[:2])
-        self.peers[local] = (CF, ip)   # before any byte goes up, so before the server's handshake ends
+        entry = self.peers[local] = (CF, ip)   # before any byte goes up, so before the server's handshake ends
         try:
             await self._pipe(ws, reader, writer)
         finally:
             if self.owns_peers:
                 self.peers.pop(local, None)
+            else:
+                forget_later(self.peers, local, entry)
             writer.close()
             try:
                 await writer.wait_closed()
@@ -268,10 +284,10 @@ def _host_port(text, default_host):
 
 
 def main():
-    # Run on its own, the gateway can't tell the server who is a guest: every guest would look
-    # like a local agent (and a local orchestrator may restart the server). Use /public.
+    # Run on its own, the gateway can't tell the server how its connections came in: each would
+    # look like a local agent (and a local orchestrator may restart the server). Use the server's Share.
     p = argparse.ArgumentParser(description="WebSocket gateway in front of the chat server (for tests; "
-                                            "use the server's /public, which marks guests)")
+                                            "use the server's Share window, which tags its connections CF)")
     sub = p.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("gateway", help="relay WebSocket connections to the chat server")
     g.add_argument("--listen", type=lambda t: _host_port(t, "127.0.0.1"), default=("127.0.0.1", 23233))
